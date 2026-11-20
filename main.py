@@ -101,9 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     flt.add_argument("--no-body-emails", action="store_true",
                      help="Ne pas extraire les adresses citees dans le corps des messages")
 
-    att = p.add_argument_group("pieces jointes (experimental : le texte n'est pas encore exploite)")
-    att.add_argument("--attachments-text", action="store_true",
-                     help="Lire le texte des pieces jointes (PDF / OCR) ; lent")
+    att = p.add_argument_group("pieces jointes (PDF / OCR / vCards, extraction parallele)")
+    att.add_argument("--attachments-text", action="store_true", default=True,
+                     help="Lire le texte des pieces jointes (PDF / OCR / vCards) ; active par defaut")
+    att.add_argument("--no-attachments-text", action="store_false", dest="attachments_text",
+                     help="Ne pas lire le texte des pieces jointes")
     att.add_argument("--no-attachments", action="store_true", help="Ne pas analyser les pieces jointes")
     att.add_argument("--no-pdf", action="store_true", help="Ignorer les PDF")
     att.add_argument("--no-images", action="store_true", help="Ignorer les images")

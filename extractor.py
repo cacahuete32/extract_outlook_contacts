@@ -12,6 +12,11 @@ Optimisations & Corrections :
     signature (il devenait les « dernières lignes » analysées) : il ne sert qu'aux
     adresses email ; une signature en IMAGE est analysée à part, avec preuve.
   * _parse_signature_full analyse de nouveau le message ENTIER (hors citations).
+  * LECTURE DES PIECES JOINTES ACTIVEE PAR DEFAUT : PDF + OCR (extraction
+    parallele, voir outlook.py) et vCards .vcf jointes transformees en contacts
+    complets (poste, societe, telephone, site, adresse).
+  * Les SMTP sans annuaire Exchange sont resolvus via CreateRecipient +
+    GetExchangeUser (carnet d'adresses) pour enrichir nom/poste/societe/telephone.
 """
 import re
 import logging
@@ -494,7 +499,7 @@ class EmailData:
                  sender_job_title="", sender_company="", sender_phone="",
                  sender_is_exchange=False,
                  attachments_text="", inline_images_text="", recipients=None,
-                 mail_id=""):
+                 vcf_contacts=None, mail_id=""):  # vCards jointes -> contacts
         self.mail_id = mail_id
         self.folder_path = folder_path
         self.project_name = project_name
@@ -512,6 +517,7 @@ class EmailData:
         self.attachments_text = attachments_text
         self.inline_images_text = inline_images_text
         self.recipients = recipients or []
+        self.vcf_contacts = vcf_contacts or []
 
 
 # ----------------------------------------------------------------------
@@ -521,10 +527,11 @@ class EmailData:
 class MailConverter:
     def __init__(self, outlook=None, include_recipients: bool = True,
                  exclude_domains: Optional[List[str]] = None,
-                 read_attachment_text: bool = False,
+                 read_attachment_text: bool = True,
                  skip_pdf: bool = False, skip_images: bool = False,
                  skip_office: bool = False):
         self.outlook = outlook
+        self.namespace = _safe_attr(outlook, "namespace")
         self.include_recipients = include_recipients
         self.exclude_domains = exclude_domains or []
         self.read_attachment_text = read_attachment_text
@@ -533,6 +540,54 @@ class MailConverter:
         self.skip_office = skip_office
         self._sender_cache: Dict[str, Dict[str, Any]] = {}
         self._recipient_cache: Dict[str, Dict[str, Any]] = {}
+        self._exchange_cache: Dict[str, Dict[str, Any]] = {}
+
+    def _exchange_details(self, email: str) -> Dict[str, Any]:
+        """Resout un SMTP via le carnet d'adresses (GAL / contacts locaux)
+        meme quand GetExchangeUser n'est pas disponible directement."""
+        empty: Dict[str, Any] = {"name": "", "job_title": "", "company": "",
+                                 "phone": "", "is_exchange": False}
+        if self.namespace is None or not email:
+            return empty
+        if email in self._exchange_cache:
+            return self._exchange_cache[email]
+        try:
+            recipient = self.namespace.CreateRecipient(email)
+            resolved = bool(_safe_attr(recipient, "Resolve")()) if recipient is not None else False
+            if not resolved:
+                self._exchange_cache[email] = empty
+                return empty
+            entry = _safe_attr(recipient, "AddressEntry")
+            user = entry.GetExchangeUser() if entry is not None else None
+            if user is None:
+                self._exchange_cache[email] = empty
+                return empty
+            info = {"name": _clean(_safe_attr(user, "Name")),
+                    "job_title": _clean(_safe_attr(user, "JobTitle")),
+                    "company": _clean(_safe_attr(user, "CompanyName")),
+                    "phone": (_clean(_safe_attr(user, "BusinessTelephoneNumber"))
+                              or _clean(_safe_attr(user, "MobileTelephoneNumber"))),
+                    "is_exchange": True}
+        except Exception as e:
+            logger.debug(f"[EXTRACTOR] Resolution carnet d'adresses impossible ({email}): {e}")
+            info = empty
+        self._exchange_cache[email] = info
+        return info
+
+    def _fill_missing_from_directory(self, info: Dict[str, Any]) -> None:
+        """Complete les champs vides par ceux du carnet d'adresses."""
+        if info.get("is_exchange"):
+            return
+        email = info.get("email") or ""
+        if "@" not in email:
+            return
+        details = self._exchange_details(email)
+        if not details.get("is_exchange"):
+            return
+        for f in ("name", "job_title", "company", "phone"):
+            if not info.get(f) and details.get(f):
+                info[f] = details[f]
+        info["is_exchange"] = True
 
     def _sender(self, mail) -> Dict[str, Any]:
         raw_addr = _clean(_safe_attr(mail, "SenderEmailAddress"))
@@ -566,6 +621,8 @@ class MailConverter:
                 except Exception:
                     pass
 
+        self._fill_missing_from_directory(info)
+
         if key:
             self._sender_cache[key] = info
         return info
@@ -597,6 +654,7 @@ class MailConverter:
                 info["is_exchange"] = True
         except Exception:
             pass
+        self._fill_missing_from_directory(info)
         return info
 
     def _recipients(self, mail) -> List[Dict[str, Any]]:
@@ -661,6 +719,13 @@ class MailConverter:
                 except Exception:
                     pass
 
+        vcf_contacts: List[Dict[str, str]] = []
+        if self.outlook:
+            try:
+                vcf_contacts = self.outlook.get_vcf_contacts(mail)
+            except Exception as e:
+                logger.debug(f"[EXTRACTOR] Lecture vCard impossible: {e}")
+
         return EmailData(
             folder_path=folder_path,
             project_name=famille_client,
@@ -677,6 +742,7 @@ class MailConverter:
             attachments_text=attachments_text,
             inline_images_text=inline_images_text,
             recipients=self._recipients(mail) if self.include_recipients else [],
+            vcf_contacts=vcf_contacts,
             mail_id=mail_id or "",
         )
 
@@ -702,7 +768,7 @@ class ContactExtractor:
         full_rescan=False,
         process_body_emails=True,
         include_intermediate=False,
-        read_attachment_text=False,
+        read_attachment_text=True,
         refresh=False,
         max_workers=4,
     ):
@@ -1035,6 +1101,17 @@ class ContactExtractor:
         projet = folder.name
         effective = self._effective_date_from(folder.path)
 
+        if self.outlook and effective:
+            try:
+                latest = self.outlook.folder_latest_received(folder.folder)
+                if latest and latest < effective:
+                    logger.info(f"[EXTRACTOR] Dossier ignore (rien de plus recent "
+                                f"que {effective.strftime('%Y-%m-%d %H:%M')}): {folder.path}")
+                    return
+            except Exception as e:
+                logger.debug(f"[EXTRACTOR] Verrouillage rapide impossible "
+                             f"({folder.path}): {e}")
+
         if effective:
             logger.info(f"[EXTRACTOR] Traitement increment: {folder.path} "
                         f"depuis le {effective.strftime('%Y-%m-%d %H:%M')}")
@@ -1195,6 +1272,25 @@ class ContactExtractor:
                 ok &= self._extract_sender_from_data(
                     email_data, famille_client, projet, received, subject, body)
 
+            sender_email = (email_data.sender_email or "").lower().strip()
+            for vcf in email_data.vcf_contacts:
+                vcf_email = (vcf.get("email") or "").lower().strip()
+                if not vcf_email or vcf_email == sender_email:
+                    continue
+                vcf_name = vcf.get("name") \
+                    or " ".join(x for x in (vcf.get("first_name"),
+                                            vcf.get("last_name")) if x)
+                ok &= self._add_contact(
+                    email=vcf_email, name=vcf_name,
+                    job_title=vcf.get("job_title") or "",
+                    phone=vcf.get("phone") or "",
+                    company=vcf.get("company") or "",
+                    website=vcf.get("website") or "",
+                    address=vcf.get("address") or "",
+                    project=famille_client, subfolder=projet, parent=famille_client,
+                    last_activity=received, last_subject=subject,
+                    sources=self._vcf_sources(vcf))
+
             if self.include_recipients and email_data.recipients:
                 for recipient in email_data.recipients:
                     ok &= self._extract_recipient_from_data(
@@ -1277,6 +1373,16 @@ class ContactExtractor:
                 or (e_local and e_local in s_local)
         return not require_proof
 
+    @staticmethod
+    def _vcf_sources(vcf: Dict[str, str]) -> Dict[str, str]:
+        sources: Dict[str, str] = {}
+        for f in ("job_title", "company", "phone", "website", "address"):
+            if vcf.get(f):
+                sources[f] = "signature"
+        if vcf.get("name"):
+            sources["name"] = "signature"
+        return sources
+
     def _extract_sender_from_data(self, email_data: EmailData, famille_client: str,
                                   projet: str, received: Optional[datetime],
                                   subject: str, body: str) -> bool:
@@ -1298,6 +1404,25 @@ class ContactExtractor:
             for f in ("job_title", "phone", "company"):
                 if raw[f]:
                     sources[f] = "exchange"
+
+            matched_vcf: Optional[Dict[str, str]] = None
+            for vcf in email_data.vcf_contacts:
+                if (vcf.get("email") or "").lower().strip() == email:
+                    matched_vcf = vcf
+                    break
+            if matched_vcf:
+                vcf_name = matched_vcf.get("name") \
+                    or " ".join(x for x in (matched_vcf.get("first_name"),
+                                            matched_vcf.get("last_name")) if x)
+                for f, v in (("name", vcf_name),
+                             ("job_title", matched_vcf.get("job_title")),
+                             ("company", matched_vcf.get("company")),
+                             ("phone", matched_vcf.get("phone")),
+                             ("website", matched_vcf.get("website")),
+                             ("address", matched_vcf.get("address"))):
+                    if v and not raw.get(f):
+                        raw[f] = v
+                        sources[f] = "signature"
 
             sig = self._parse_signature(body, email)
             if sig and not self._signature_belongs_to_sender(

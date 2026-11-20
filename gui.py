@@ -27,7 +27,7 @@ import pythoncom
 sys.path.insert(0, str(Path(__file__).parent))
 
 from outlook import OutlookConnector, OutlookFolder
-from extractor import ContactExtractor, EmailData, PR_SMTP_ADDRESS, _mail_body
+from extractor import ContactExtractor, EmailData, MailConverter, PR_SMTP_ADDRESS, _mail_body
 from exporter import DataExporter
 from review import AccountReview
 from state import ExtractionState
@@ -137,8 +137,9 @@ class MailReader:
         self.outlook = outlook
         self.cfg = cfg
         self._warn = warn
+        self._resolver = MailConverter(outlook=outlook, include_recipients=False)
         self._sender_cache: Dict[str, Dict[str, Any]] = {}
-        self._recipient_cache: Dict[str, Tuple[str, str]] = {}
+        self._recipient_cache: Dict[str, Dict[str, Any]] = {}
 
     def _sender(self, mail) -> Dict[str, Any]:
         raw_addr = _com_str(_safe(mail, "SenderEmailAddress"))
@@ -163,7 +164,8 @@ class MailReader:
                 info["name"] = _com_str(_safe(exch, "Name")) or info["name"]
                 info["job_title"] = _com_str(_safe(exch, "JobTitle"))
                 info["company"] = _com_str(_safe(exch, "CompanyName"))
-                info["phone"] = _com_str(_safe(exch, "BusinessTelephoneNumber"))
+                info["phone"] = (_com_str(_safe(exch, "BusinessTelephoneNumber"))
+                                 or _com_str(_safe(exch, "MobileTelephoneNumber")))
                 info["is_exchange"] = True
 
             if "@" not in info["email"]:
@@ -173,31 +175,14 @@ class MailReader:
                 except Exception:
                     pass
 
+        self._resolver._fill_missing_from_directory(info)
+
         if key:
             self._sender_cache[key] = info
         return info
 
-    def _resolve_recipient(self, recipient, addr_raw: str) -> Tuple[str, str]:
-        name = _com_str(_safe(recipient, "Name"))
-        email = ""
-        try:
-            email = _com_str(recipient.PropertyAccessor.GetProperty(PR_SMTP_ADDRESS))
-        except Exception:
-            pass
-        if not email:
-            email = addr_raw
-        try:
-            entry = _safe(recipient, "AddressEntry")
-            user = entry.GetExchangeUser() if entry is not None else None
-            if user:
-                email = _com_str(_safe(user, "PrimarySmtpAddress")) or email
-                name = _com_str(_safe(user, "Name")) or name
-        except Exception:
-            pass
-        return email.lower().strip(), name
-
-    def _recipients(self, mail) -> List[Dict[str, str]]:
-        out: List[Dict[str, str]] = []
+    def _recipients(self, mail) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
         seen: Set[str] = set()
         recipients = _safe(mail, "Recipients")
         if recipients is None:
@@ -211,15 +196,24 @@ class MailReader:
                 addr_raw = _com_str(_safe(r, "Address"))
                 key = (addr_raw or _com_str(_safe(r, "Name"))).lower()
                 if key and key in self._recipient_cache:
-                    email, name = self._recipient_cache[key]
+                    info = self._recipient_cache[key]
                 else:
-                    email, name = self._resolve_recipient(r, addr_raw)
+                    resolved = self._resolver._resolve_recipient(r, addr_raw)
+                    info = {
+                        "email": resolved["email"],
+                        "name": resolved["name"],
+                        "job_title": resolved.get("job_title", "") or "",
+                        "company": resolved.get("company", "") or "",
+                        "phone": resolved.get("phone", "") or "",
+                        "is_exchange": bool(resolved.get("is_exchange")),
+                    }
                     if key:
-                        self._recipient_cache[key] = (email, name)
+                        self._recipient_cache[key] = info
+                email = info["email"]
                 if (email and email not in seen and is_valid_email(email)
                         and not _is_excluded(email, self.cfg.exclude_domains)):
                     seen.add(email)
-                    out.append({"email": email, "name": name})
+                    out.append(info)
             except Exception:
                 continue
         return out
@@ -252,6 +246,12 @@ class MailReader:
                 self._warn(f"Erreur images inline: {e}")
 
         recipients = self._recipients(mail) if cfg.include_recipients else []
+        vcf_contacts = []
+        resolver = self._resolver
+        try:
+            vcf_contacts = self.outlook.get_vcf_contacts(mail)
+        except Exception as e:
+            self._warn(f"Erreur vCard: {e}")
 
         return EmailData(
             folder_path=folder.path,
@@ -269,6 +269,7 @@ class MailReader:
             attachments_text=attachments_text,
             inline_images_text=inline_images_text,
             recipients=recipients,
+            vcf_contacts=vcf_contacts,
             mail_id=mail_id or "",
         )
 
@@ -297,9 +298,9 @@ class ContactExtractionGUI:
         self.ocr_inline_var = tk.BooleanVar(value=False)
         self.debug_var = tk.BooleanVar(value=False)
         self.all_folders_var = tk.BooleanVar(value=False)
-        self.no_attachments_var = tk.BooleanVar(value=True)
-        self.no_pdf_var = tk.BooleanVar(value=True)
-        self.no_images_var = tk.BooleanVar(value=True)
+        self.no_attachments_var = tk.BooleanVar(value=False)
+        self.no_pdf_var = tk.BooleanVar(value=False)
+        self.no_images_var = tk.BooleanVar(value=False)
         self.no_office_var = tk.BooleanVar(value=True)
         self.full_rescan_var = tk.BooleanVar(value=False)
         self.refresh_var = tk.BooleanVar(value=False)
