@@ -532,7 +532,7 @@ class MailConverter:
         self.skip_images = skip_images
         self.skip_office = skip_office
         self._sender_cache: Dict[str, Dict[str, Any]] = {}
-        self._recipient_cache: Dict[str, Tuple[str, str]] = {}
+        self._recipient_cache: Dict[str, Dict[str, Any]] = {}
 
     def _sender(self, mail) -> Dict[str, Any]:
         raw_addr = _clean(_safe_attr(mail, "SenderEmailAddress"))
@@ -556,7 +556,8 @@ class MailConverter:
                 info["name"] = _clean(_safe_attr(exch, "Name")) or info["name"]
                 info["job_title"] = _clean(_safe_attr(exch, "JobTitle"))
                 info["company"] = _clean(_safe_attr(exch, "CompanyName"))
-                info["phone"] = _clean(_safe_attr(exch, "BusinessTelephoneNumber"))
+                info["phone"] = (_clean(_safe_attr(exch, "BusinessTelephoneNumber"))
+                                 or _clean(_safe_attr(exch, "MobileTelephoneNumber")))
                 info["is_exchange"] = True
             if "@" not in info["email"]:
                 try:
@@ -569,7 +570,9 @@ class MailConverter:
             self._sender_cache[key] = info
         return info
 
-    def _resolve_recipient(self, recipient, addr_raw: str) -> Tuple[str, str]:
+    def _resolve_recipient(self, recipient, addr_raw: str) -> Dict[str, Any]:
+        """Resolve un destinataire : SMTP + poste, societe et telephone de
+        l'annuaire Exchange quand ils sont disponibles."""
         name = _clean(_safe_attr(recipient, "Name"))
         email = ""
         try:
@@ -578,18 +581,26 @@ class MailConverter:
             pass
         if not email:
             email = addr_raw
+        info: Dict[str, Any] = {"email": (email or "").lower().strip(), "name": name,
+                                "job_title": "", "company": "", "phone": "",
+                                "is_exchange": False}
         try:
             entry = _safe_attr(recipient, "AddressEntry")
             user = entry.GetExchangeUser() if entry is not None else None
             if user:
-                email = _clean(_safe_attr(user, "PrimarySmtpAddress")) or email
-                name = _clean(_safe_attr(user, "Name")) or name
+                info["email"] = _clean(_safe_attr(user, "PrimarySmtpAddress")) or info["email"]
+                info["name"] = _clean(_safe_attr(user, "Name")) or name
+                info["job_title"] = _clean(_safe_attr(user, "JobTitle"))
+                info["company"] = _clean(_safe_attr(user, "CompanyName"))
+                info["phone"] = (_clean(_safe_attr(user, "BusinessTelephoneNumber"))
+                                 or _clean(_safe_attr(user, "MobileTelephoneNumber")))
+                info["is_exchange"] = True
         except Exception:
             pass
-        return email.lower().strip(), name
+        return info
 
-    def _recipients(self, mail) -> List[Dict[str, str]]:
-        out: List[Dict[str, str]] = []
+    def _recipients(self, mail) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
         seen: Set[str] = set()
         recipients = _safe_attr(mail, "Recipients")
         if recipients is None:
@@ -603,15 +614,22 @@ class MailConverter:
                 addr_raw = _clean(_safe_attr(r, "Address"))
                 key = (addr_raw or _clean(_safe_attr(r, "Name"))).lower()
                 if key and key in self._recipient_cache:
-                    email, name = self._recipient_cache[key]
+                    info = self._recipient_cache[key]
                 else:
-                    email, name = self._resolve_recipient(r, addr_raw)
+                    info = self._resolve_recipient(r, addr_raw)
                     if key:
-                        self._recipient_cache[key] = (email, name)
+                        self._recipient_cache[key] = info
+                email = info.get("email", "")
                 if (email and email not in seen and is_valid_email(email)
                         and not _is_excluded_addr(email, self.exclude_domains)):
                     seen.add(email)
-                    out.append({"email": email, "name": name})
+                    out.append({
+                        "email": email, "name": info.get("name", ""),
+                        "job_title": info.get("job_title", "") or "",
+                        "company": info.get("company", "") or "",
+                        "phone": info.get("phone", "") or "",
+                        "is_exchange": bool(info.get("is_exchange")),
+                    })
             except Exception:
                 continue
         return out
@@ -881,8 +899,11 @@ class ContactExtractor:
                         sources.get("name", "header"))
         if existing.name and not (existing.first_name and existing.last_name):
             first, last = split_name(_normalize_person_name(existing.name))
-            existing.first_name = existing.first_name or (first or "")
-            existing.last_name = existing.last_name or (last or "")
+            if first and last:
+                existing.first_name, existing.last_name = first, last
+            else:
+                existing.first_name = existing.first_name or (first or "")
+                existing.last_name = existing.last_name or (last or "")
 
         self._set_field(existing, "job_title", _valid_job_title(
                             new_job_title, trusted=(sources.get("job_title") == "exchange")),
@@ -1334,12 +1355,22 @@ class ContactExtractor:
             email = (recipient.get("email") or "").lower().strip()
             if not email or not is_valid_email(email):
                 return True
+            sources: Dict[str, str] = {"name": "header"}
+            if recipient.get("is_exchange"):
+                if recipient.get("name"):
+                    sources["name"] = "exchange"
+                for f in ("job_title", "company", "phone"):
+                    if recipient.get(f):
+                        sources[f] = "exchange"
             return self._add_contact(
-                email=email, name=recipient.get("name") or "", job_title="",
-                phone="", company="", website="", address="",
+                email=email, name=recipient.get("name") or "",
+                job_title=recipient.get("job_title") or "",
+                phone=recipient.get("phone") or "",
+                company=recipient.get("company") or "",
+                website="", address="",
                 project=famille_client, subfolder=projet, parent=famille_client,
                 last_activity=received, last_subject=subject,
-                sources={"name": "header"})
+                sources=sources)
         except Exception as e:
             logger.error(f"[EXTRACTOR] Erreur destinataire (data): {e}")
             return False
