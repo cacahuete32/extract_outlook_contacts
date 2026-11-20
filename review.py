@@ -20,6 +20,10 @@ Corrections par rapport à la version précédente :
   * Écriture Excel atomique (copie temporaire puis os.replace) : un plantage
     ne corrompt plus le classeur ; chaînes commençant par « = » protégées.
   * Les dates sont toutes naïves (plus de bricolage UTC/aware).
+  * TOUTE entreprise observee (historique persiste, run courant, Excel cumule)
+    est revalidee par extractor._valid_company : les phrases, sigles et
+    fragments stockes par les anciens runs disparaissent de la revue au
+    prochain passage sans toucher manuellement au .history.json.
 
 API inchangée : AccountReview(contacts), .append_to_excel(path), .gui_data().
 Appeler append_to_excel() AVANT gui_data() pour obtenir la vue cumulée.
@@ -256,7 +260,7 @@ class AccountReview:
         out: Dict[str, List[Dict[str, Any]]] = {}
 
         def add(key, company, date, email, name):
-            company = _s(company)
+            company = _valid_company(_s(company), _s(email))
             if not key or not company:
                 return
             out.setdefault(key, []).append({

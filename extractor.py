@@ -17,6 +17,9 @@ Optimisations & Corrections :
     complets (poste, societe, telephone, site, adresse).
   * Les SMTP sans annuaire Exchange sont resolvus via CreateRecipient +
     GetExchangeUser (carnet d'adresses) pour enrichir nom/poste/societe/telephone.
+  * FIABILITE ENTREPRISES : utils.is_plausible_company rejette les phrases,
+    slogans, sigles courts hors domaine et fragments de signature ; societe =
+    nom du contact refusee ; noms nettoyees (email embarque, " / ", " - ").
 """
 import re
 import logging
@@ -28,8 +31,10 @@ from threading import Lock
 
 from outlook import OutlookFolder
 from utils import (
+    GENERIC_MAILBOXES,
     LEGAL_SUFFIX_RE,
     body_text_from_html,
+    is_plausible_company,
     is_plausible_job_title,
     is_valid_email,
     normalize_phone,
@@ -86,7 +91,7 @@ QUOTE_ATTRIBUTION_RE = re.compile(
 )
 
 QUOTE_HEADER_RE = re.compile(
-    r"^(objet|subject|asunto|de|from|envoy\u00e9|sent|date|cc|a|to)\s*[:：]",
+    r"^(objet|oggetto|subject|asunto|de|from|envoy\u00e9|sent|date|cc|a|to)\s*[:：]",
     re.IGNORECASE,
 )
 PHONE_PREFIX_RE = re.compile(
@@ -191,6 +196,7 @@ def _clean(value) -> str:
     s = value.strip()
     s = re.sub(r"^mailto:", "", s, flags=re.IGNORECASE).strip()
     s = s.strip("<>")
+    s = re.sub(r"\s*<[^<>]*@[^<>]*>?\s*$", "", s)
     s = re.sub(r"\s+", " ", s)
     return s
 
@@ -260,6 +266,12 @@ def _valid_name(s: str) -> str:
         return ""
     if _is_email_like(s) or _is_url_like(s):
         return ""
+    for sep in (" / ", " - "):
+        if sep in s:
+            cut = s.split(sep, 1)[0].strip()
+            if cut:
+                s = _clean(_normalize_person_name(cut))
+                break
     return s
 
 
@@ -312,6 +324,14 @@ def _company_domain_token(email: str) -> str:
     return re.sub(r"[^a-z0-9]", "", _domain_label(email))
 
 
+def _upper_token_matches_domain(token: str, email: str) -> bool:
+    token = re.sub(r"[^A-Za-z\u00c0-\u00ff]", "", token or "").lower()
+    if len(token) < 2:
+        return False
+    domain_token = _company_domain_token(email)
+    return bool(domain_token and (token in domain_token or domain_token in token))
+
+
 def _looks_like_project_code(s: str) -> bool:
     s = s.strip()
     if not s:
@@ -343,6 +363,7 @@ def _looks_like_person(s: str) -> bool:
 
 def _valid_company(s: str, email: str = "", trusted: bool = False) -> str:
     s = _clean(s)
+    s = s.strip(" \t+-\u2013\u2014|")
     if not s:
         return ""
 
@@ -397,6 +418,10 @@ def _valid_company(s: str, email: str = "", trusted: bool = False) -> str:
         return ""
     if re.search(r"\b(rue|avenue|boulevard|street|road|calle|plaza|allee|chemin)\b", lower):
         return ""
+    if not is_plausible_company(s):
+        if not (s.isupper() and len(s.split()) == 1
+                and _upper_token_matches_domain(s, email)):
+            return ""
     return s
 
 
@@ -1016,6 +1041,9 @@ class ContactExtractor:
     @staticmethod
     def _guess_name_from_email(contact: ContactInfo):
         local = contact.email.split("@")[0]
+        bare = re.sub(r"[0-9._-]+$", "", local).strip("._-")
+        if "." not in local and (len(bare) < 3 or bare.lower() in GENERIC_MAILBOXES):
+            return
         if "." in local and all(len(p) >= 2 for p in local.split(".")):
             guessed = " ".join(local.split(".")).title()
             contact.name = guessed
