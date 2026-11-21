@@ -6,6 +6,9 @@ Améliorations intégrées :
   * Améliorations ergonomiques et visuelles (thème, dispositions, états de boutons).
   * Checkpoint validé APRÈS un export réussi.
   * Gestion robuste des files et de la file unique vers l'UI (`ui_queue`).
+  * La liste des dossiers affiche TOUTE l'arborescence (ex : OEM > SCAM TPE)
+    avec indentation ; un sous-dossier profond peut etre coche seul et ses
+    contacts rataches a la bonne famille client.
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
@@ -56,6 +59,13 @@ def _safe(obj, attr, default=None):
         return getattr(obj, attr)
     except Exception:
         return default
+
+
+def _safe_folder_path(folder: Any) -> str:
+    try:
+        return folder.FolderPath or ""
+    except Exception:
+        return ""
 
 
 def _is_excluded(addr: str, domains: List[str]) -> bool:
@@ -493,26 +503,31 @@ class ContactExtractionGUI:
             self.folders_list = []
 
             inbox = self.outlook.get_inbox()
-            direct_subfolders = self.outlook.get_direct_subfolders(inbox)
+            inbox_path = (getattr(self.outlook, "inbox_path", None)
+                          or _safe_folder_path(inbox))
+            all_folders = list(self.outlook.get_all_subfolders(inbox))[:500]
 
-            if not direct_subfolders:
+            if not all_folders:
                 ttk.Label(self.folders_container,
                           text="Aucun sous-dossier trouvé dans la boîte de réception.",
                           foreground="red").pack(pady=10)
                 return
 
-            for folder in direct_subfolders:
+            for folder in all_folders:
                 var = tk.BooleanVar(value=True)
                 self.folder_vars[self._folder_key(folder)] = var
                 self.folders_list.append(folder)
 
+                depth = max(0, folder.path.count("\\")
+                            - (inbox_path.count("\\") if inbox_path else 1))
+                indent = "     " * min(depth, 6) + ("└ " if depth else "")
                 frame = ttk.Frame(self.folders_container)
-                frame.pack(fill=tk.X, pady=2)
-                ttk.Checkbutton(frame, variable=var).pack(side=tk.LEFT, padx=5)
-                ttk.Label(frame, text=f"{folder.name} ({folder.path})"
+                frame.pack(fill=tk.X, pady=1)
+                ttk.Checkbutton(frame, variable=var).pack(side=tk.LEFT, padx=(5 + 12 * min(depth, 6), 5))
+                ttk.Label(frame, text=f"{indent}{folder.name}"
                           ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-            self._log_info(f"Trouvé {len(direct_subfolders)} dossiers.")
+            self._log_info(f"Trouvé {len(all_folders)} dossiers (arborescence complète).")
         except Exception as e:
             self._log_error(f"Erreur lors du chargement des dossiers : {e}")
 

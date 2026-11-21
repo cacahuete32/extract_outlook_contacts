@@ -20,6 +20,9 @@ Corrections par rapport à la version précédente :
   * OCR : image lue une seule fois (imdecode, compatible chemins non-ASCII),
     timeout Tesseract, repli sur « eng » si le pack « fra » est absent.
   * pypdf (successeur de PyPDF2) utilisé s'il est installé.
+  * Filtre MessageClass en LIKE ('IPM.Note%') : les mails signés (IPM.Note.SMIME),
+    formulaires personnalisés et autres sous-classes ne sont plus invisibles
+    (un dossier comme OEM/SCAM TPE pouvait paraitre vide).
   * is_valid_email / parse_date délèguent à utils (plus de doublons qui
     divergent : info@ était accepté ici et rejeté ailleurs).
   * Dossier temporaire créé à la demande et supprimé par close() ;
@@ -510,15 +513,21 @@ class OutlookConnector:
     # ------------------------------------------------------------------
 
     def _restrict_mail_items(self, items: Any) -> Tuple[Any, bool]:
-        """Filtre les IPM.Note directement dans Outlook (rapide ; sans effet de
-        locale, contrairement au filtre de dates). Renvoie (collection, ok) :
-        ok est False si Outlook a refuse le filtre (repli : iterer tel quel)."""
-        try:
-            restricted = items.Restrict("[MessageClass] = 'IPM.Note'")
-            return restricted, True
-        except Exception as e:
-            logger.debug(f"[OUTLOOK] Restrict MessageClass indisponible: {e}")
-            return items, False
+        """Filtre les IPM.Note (ET toutes leurs sous-classes : IPM.Note.SMIME,
+        formulaires personnalises...) directement dans Outlook (rapide ; sans
+        effet de locale). Renvoie (collection, ok) : ok est False si Outlook a
+        refuse le filtre (repli : iterer tel quel)."""
+        for query in (
+                '@SQL="http://schemas.microsoft.com/mapi/proptag/0x001A001E"'
+                " LIKE 'IPM.Note%'",
+                "[MessageClass] = 'IPM.Note'",
+        ):
+            try:
+                restricted = items.Restrict(query)
+                return restricted, True
+            except Exception as e:
+                logger.debug(f"[OUTLOOK] Restrict MessageClass refuse: {e}")
+        return items, False
 
     def get_mails(self, folder: Any, date_from: Optional[datetime] = None,
                   date_to: Optional[datetime] = None,
