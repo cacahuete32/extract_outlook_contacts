@@ -11,6 +11,9 @@ Améliorations intégrées :
     contacts rataches a la bonne famille client.
   * Sélection simplifiée : filtre de recherche, cocher un dossier coche
     tous ses sous-dossiers d'un coup, compteur « n/N sélectionnés ».
+  * Sélection multiple à la souris : Ctrl+clic coche/décoche une seule
+    case, Maj+clic applique la valeur à toute la plage depuis la dernière
+    case cliquée (indépendantes des sous-dossiers masqués par le filtre).
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
@@ -324,6 +327,9 @@ class ContactExtractionGUI:
         self.folder_search_var.trace_add("write", lambda *_: self._filter_folders())
         self._folder_frames: List[Tuple[OutlookFolder, ttk.Frame]] = []
         self._folder_children: Dict[str, List[str]] = {}
+        self._folder_visible: Dict[str, bool] = {}
+        self._last_folder_key: Optional[str] = None
+        self._click_mode = ""
         self.last_generated_file: Optional[str] = None
 
         self.ui_queue: Queue = Queue()
@@ -414,6 +420,8 @@ class ContactExtractionGUI:
                    command=self._deselect_all_folders).pack(side=tk.LEFT, padx=2)
         self.selected_count_label = ttk.Label(buttons_frame, text="")
         self.selected_count_label.pack(side=tk.RIGHT, padx=5)
+        ttk.Label(buttons_frame, text="Maj+clic : plage  ·  Ctrl+clic : une case",
+                  foreground="gray").pack(side=tk.RIGHT, padx=10)
 
         # --- Onglet options
         options_frame = ttk.LabelFrame(options_tab, text=" Paramètres d'extraction ", padding=10)
@@ -517,6 +525,9 @@ class ContactExtractionGUI:
             self.folders_list = []
             self._folder_frames.clear()
             self._folder_children.clear()
+            self._folder_visible.clear()
+            self._last_folder_key = None
+            self._click_mode = ""
 
             inbox = self.outlook.get_inbox()
             inbox_path = (getattr(self.outlook, "inbox_path", None)
@@ -544,12 +555,17 @@ class ContactExtractionGUI:
                 indent = "     " * min(depth, 6) + ("└ " if depth else "")
                 frame = ttk.Frame(self.folders_container)
                 frame.pack(fill=tk.X, pady=1)
-                ttk.Checkbutton(frame, variable=var,
-                                command=lambda k=key: self._on_folder_toggle(k)
-                                ).pack(side=tk.LEFT, padx=(5 + 12 * min(depth, 6), 5))
+                cb = ttk.Checkbutton(frame, variable=var,
+                                     command=lambda k=key: self._on_folder_toggle(k))
+                cb.bind("<Shift-Button-1>",
+                        lambda e, m="shift": self._set_click_mode(m))
+                cb.bind("<Control-Button-1>",
+                        lambda e, m="ctrl": self._set_click_mode(m))
+                cb.pack(side=tk.LEFT, padx=(5 + 12 * min(depth, 6), 5))
                 ttk.Label(frame, text=f"{indent}{folder.name}"
                           ).pack(side=tk.LEFT, fill=tk.X, expand=True)
                 self._folder_frames.append((folder, frame))
+                self._folder_visible[key] = True
 
                 parent_path = folder.path.rsplit("\\", 1)[0]
                 parent_key = key_by_path.get(parent_path)
@@ -571,27 +587,54 @@ class ContactExtractionGUI:
             var.set(False)
         self._update_selected_count()
 
+    def _set_click_mode(self, mode: str):
+        self._click_mode = mode
+
     def _on_folder_toggle(self, key: str):
         var = self.folder_vars.get(key)
         if var is None:
             return
+        mode = self._click_mode
+        self._click_mode = ""
         value = var.get()
-        stack = list(self._folder_children.get(key, ()))
-        while stack:
-            child_key = stack.pop()
-            child_var = self.folder_vars.get(child_key)
-            if child_var is not None:
-                child_var.set(value)
-            stack.extend(self._folder_children.get(child_key, ()))
+        if mode == "ctrl":
+            pass
+        elif mode == "shift" and self._last_folder_key in self.folder_vars:
+            self._apply_range(self._last_folder_key, key, value)
+        else:
+            stack = list(self._folder_children.get(key, ()))
+            while stack:
+                child_key = stack.pop()
+                child_var = self.folder_vars.get(child_key)
+                if child_var is not None:
+                    child_var.set(value)
+                stack.extend(self._folder_children.get(child_key, ()))
+        self._last_folder_key = key
         self._update_selected_count()
+
+    def _apply_range(self, key_from: str, key_to: str, value: bool):
+        order = [self._folder_key(f) for f, _ in self._folder_frames]
+        visible = [k for k in order if self._folder_visible.get(k, True)]
+        if key_from not in visible or key_to not in visible:
+            return
+        i1, i2 = visible.index(key_from), visible.index(key_to)
+        if i1 > i2:
+            i1, i2 = i2, i1
+        for k in visible[i1:i2 + 1]:
+            v = self.folder_vars.get(k)
+            if v is not None:
+                v.set(value)
 
     def _filter_folders(self):
         query = self.folder_search_var.get().strip().lower()
         for folder, frame in self._folder_frames:
-            if query and query not in str(folder.name).lower():
-                frame.pack_forget()
-            else:
+            key = self._folder_key(folder)
+            visible = not query or query in str(folder.name).lower()
+            self._folder_visible[key] = visible
+            if visible:
                 frame.pack(fill=tk.X, pady=1)
+            else:
+                frame.pack_forget()
 
     def _update_selected_count(self):
         label = getattr(self, "selected_count_label", None)
