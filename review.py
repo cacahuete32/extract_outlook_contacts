@@ -20,6 +20,14 @@ Corrections par rapport à la version précédente :
   * Écriture Excel atomique (copie temporaire puis os.replace) : un plantage
     ne corrompt plus le classeur ; chaînes commençant par « = » protégées.
   * Les dates sont toutes naïves (plus de bricolage UTC/aware).
+  * TOUTE entreprise observee (historique persiste, run courant, Excel cumule)
+    est revalidee par extractor._valid_company : les phrases, sigles et
+    fragments stockes par les anciens runs disparaissent de la revue au
+    prochain passage sans toucher manuellement au .history.json.
+  * COHERENCE EMAIL : une observation doit recouper le domaine de l'adresse
+    (TORAY sur fgoffaux@prindustries.fr = ecarte) ; deux entreprises du meme
+    employeur sur la meme adresse (spig-gmab <-> SPIG S.p.A.) ne comptent
+    plus comme un changement.
 
 API inchangée : AccountReview(contacts), .append_to_excel(path), .gui_data().
 Appeler append_to_excel() AVANT gui_data() pour obtenir la vue cumulée.
@@ -38,6 +46,7 @@ from openpyxl.utils import get_column_letter
 
 from extractor import (
     ContactInfo,
+    _company_matches_email,
     _normalize_person_name,
     _person_key,
     _same_company,
@@ -256,8 +265,10 @@ class AccountReview:
         out: Dict[str, List[Dict[str, Any]]] = {}
 
         def add(key, company, date, email, name):
-            company = _s(company)
+            company = _valid_company(_s(company), _s(email))
             if not key or not company:
+                return
+            if not _company_matches_email(company, _s(email)):
                 return
             out.setdefault(key, []).append({
                 "company": company, "date": date,
@@ -326,6 +337,11 @@ class AccountReview:
                 rec_key = (new["email"].lower(), old["company"].lower(),
                            new["company"].lower())
                 if rec_key in seen:
+                    continue
+                same_employer = (old["email"] and old["email"] == new["email"]
+                                 and _company_matches_email(old["company"], old["email"])
+                                 and _company_matches_email(new["company"], new["email"]))
+                if same_employer:
                     continue
                 seen.add(rec_key)
                 self._changes.append({

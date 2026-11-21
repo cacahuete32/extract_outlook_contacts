@@ -6,6 +6,9 @@ Améliorations intégrées :
   * Améliorations ergonomiques et visuelles (thème, dispositions, états de boutons).
   * Checkpoint validé APRÈS un export réussi.
   * Gestion robuste des files et de la file unique vers l'UI (`ui_queue`).
+  * La liste des dossiers affiche TOUTE l'arborescence (ex : OEM > SCAM TPE)
+    avec indentation ; un sous-dossier profond peut etre coche seul et ses
+    contacts rataches a la bonne famille client.
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
@@ -27,7 +30,7 @@ import pythoncom
 sys.path.insert(0, str(Path(__file__).parent))
 
 from outlook import OutlookConnector, OutlookFolder
-from extractor import ContactExtractor, EmailData, PR_SMTP_ADDRESS, _mail_body
+from extractor import ContactExtractor, EmailData, MailConverter, PR_SMTP_ADDRESS, _mail_body
 from exporter import DataExporter
 from review import AccountReview
 from state import ExtractionState
@@ -56,6 +59,13 @@ def _safe(obj, attr, default=None):
         return getattr(obj, attr)
     except Exception:
         return default
+
+
+def _safe_folder_path(folder: Any) -> str:
+    try:
+        return folder.FolderPath or ""
+    except Exception:
+        return ""
 
 
 def _is_excluded(addr: str, domains: List[str]) -> bool:
@@ -137,8 +147,9 @@ class MailReader:
         self.outlook = outlook
         self.cfg = cfg
         self._warn = warn
+        self._resolver = MailConverter(outlook=outlook, include_recipients=False)
         self._sender_cache: Dict[str, Dict[str, Any]] = {}
-        self._recipient_cache: Dict[str, Tuple[str, str]] = {}
+        self._recipient_cache: Dict[str, Dict[str, Any]] = {}
 
     def _sender(self, mail) -> Dict[str, Any]:
         raw_addr = _com_str(_safe(mail, "SenderEmailAddress"))
@@ -163,7 +174,8 @@ class MailReader:
                 info["name"] = _com_str(_safe(exch, "Name")) or info["name"]
                 info["job_title"] = _com_str(_safe(exch, "JobTitle"))
                 info["company"] = _com_str(_safe(exch, "CompanyName"))
-                info["phone"] = _com_str(_safe(exch, "BusinessTelephoneNumber"))
+                info["phone"] = (_com_str(_safe(exch, "BusinessTelephoneNumber"))
+                                 or _com_str(_safe(exch, "MobileTelephoneNumber")))
                 info["is_exchange"] = True
 
             if "@" not in info["email"]:
@@ -173,31 +185,14 @@ class MailReader:
                 except Exception:
                     pass
 
+        self._resolver._fill_missing_from_directory(info)
+
         if key:
             self._sender_cache[key] = info
         return info
 
-    def _resolve_recipient(self, recipient, addr_raw: str) -> Tuple[str, str]:
-        name = _com_str(_safe(recipient, "Name"))
-        email = ""
-        try:
-            email = _com_str(recipient.PropertyAccessor.GetProperty(PR_SMTP_ADDRESS))
-        except Exception:
-            pass
-        if not email:
-            email = addr_raw
-        try:
-            entry = _safe(recipient, "AddressEntry")
-            user = entry.GetExchangeUser() if entry is not None else None
-            if user:
-                email = _com_str(_safe(user, "PrimarySmtpAddress")) or email
-                name = _com_str(_safe(user, "Name")) or name
-        except Exception:
-            pass
-        return email.lower().strip(), name
-
-    def _recipients(self, mail) -> List[Dict[str, str]]:
-        out: List[Dict[str, str]] = []
+    def _recipients(self, mail) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
         seen: Set[str] = set()
         recipients = _safe(mail, "Recipients")
         if recipients is None:
@@ -211,15 +206,24 @@ class MailReader:
                 addr_raw = _com_str(_safe(r, "Address"))
                 key = (addr_raw or _com_str(_safe(r, "Name"))).lower()
                 if key and key in self._recipient_cache:
-                    email, name = self._recipient_cache[key]
+                    info = self._recipient_cache[key]
                 else:
-                    email, name = self._resolve_recipient(r, addr_raw)
+                    resolved = self._resolver._resolve_recipient(r, addr_raw)
+                    info = {
+                        "email": resolved["email"],
+                        "name": resolved["name"],
+                        "job_title": resolved.get("job_title", "") or "",
+                        "company": resolved.get("company", "") or "",
+                        "phone": resolved.get("phone", "") or "",
+                        "is_exchange": bool(resolved.get("is_exchange")),
+                    }
                     if key:
-                        self._recipient_cache[key] = (email, name)
+                        self._recipient_cache[key] = info
+                email = info["email"]
                 if (email and email not in seen and is_valid_email(email)
                         and not _is_excluded(email, self.cfg.exclude_domains)):
                     seen.add(email)
-                    out.append({"email": email, "name": name})
+                    out.append(info)
             except Exception:
                 continue
         return out
@@ -252,6 +256,12 @@ class MailReader:
                 self._warn(f"Erreur images inline: {e}")
 
         recipients = self._recipients(mail) if cfg.include_recipients else []
+        vcf_contacts = []
+        resolver = self._resolver
+        try:
+            vcf_contacts = self.outlook.get_vcf_contacts(mail)
+        except Exception as e:
+            self._warn(f"Erreur vCard: {e}")
 
         return EmailData(
             folder_path=folder.path,
@@ -269,6 +279,7 @@ class MailReader:
             attachments_text=attachments_text,
             inline_images_text=inline_images_text,
             recipients=recipients,
+            vcf_contacts=vcf_contacts,
             mail_id=mail_id or "",
         )
 
@@ -297,9 +308,9 @@ class ContactExtractionGUI:
         self.ocr_inline_var = tk.BooleanVar(value=False)
         self.debug_var = tk.BooleanVar(value=False)
         self.all_folders_var = tk.BooleanVar(value=False)
-        self.no_attachments_var = tk.BooleanVar(value=True)
-        self.no_pdf_var = tk.BooleanVar(value=True)
-        self.no_images_var = tk.BooleanVar(value=True)
+        self.no_attachments_var = tk.BooleanVar(value=False)
+        self.no_pdf_var = tk.BooleanVar(value=False)
+        self.no_images_var = tk.BooleanVar(value=False)
         self.no_office_var = tk.BooleanVar(value=True)
         self.full_rescan_var = tk.BooleanVar(value=False)
         self.refresh_var = tk.BooleanVar(value=False)
@@ -492,26 +503,31 @@ class ContactExtractionGUI:
             self.folders_list = []
 
             inbox = self.outlook.get_inbox()
-            direct_subfolders = self.outlook.get_direct_subfolders(inbox)
+            inbox_path = (getattr(self.outlook, "inbox_path", None)
+                          or _safe_folder_path(inbox))
+            all_folders = list(self.outlook.get_all_subfolders(inbox))[:500]
 
-            if not direct_subfolders:
+            if not all_folders:
                 ttk.Label(self.folders_container,
                           text="Aucun sous-dossier trouvé dans la boîte de réception.",
                           foreground="red").pack(pady=10)
                 return
 
-            for folder in direct_subfolders:
+            for folder in all_folders:
                 var = tk.BooleanVar(value=True)
                 self.folder_vars[self._folder_key(folder)] = var
                 self.folders_list.append(folder)
 
+                depth = max(0, folder.path.count("\\")
+                            - (inbox_path.count("\\") if inbox_path else 1))
+                indent = "     " * min(depth, 6) + ("└ " if depth else "")
                 frame = ttk.Frame(self.folders_container)
-                frame.pack(fill=tk.X, pady=2)
-                ttk.Checkbutton(frame, variable=var).pack(side=tk.LEFT, padx=5)
-                ttk.Label(frame, text=f"{folder.name} ({folder.path})"
+                frame.pack(fill=tk.X, pady=1)
+                ttk.Checkbutton(frame, variable=var).pack(side=tk.LEFT, padx=(5 + 12 * min(depth, 6), 5))
+                ttk.Label(frame, text=f"{indent}{folder.name}"
                           ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-            self._log_info(f"Trouvé {len(direct_subfolders)} dossiers.")
+            self._log_info(f"Trouvé {len(all_folders)} dossiers (arborescence complète).")
         except Exception as e:
             self._log_error(f"Erreur lors du chargement des dossiers : {e}")
 

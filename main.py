@@ -11,7 +11,8 @@ Corrections par rapport à la version précédente :
     connexion Outlook et d'état chargés pour rien.
   * Mode --refresh : relit tous les mails et fusionne dans l'Excel existant (complète
     les blancs des contacts déjà scannés) ; sauvegarde horodatée avant écriture.
-  * Nouvelles options : --folders (sélection non interactive par nom),
+  * Nouvelles options : --folders (sélection non interactive par nom, y
+    compris un SOUS-dossier profond comme "SCAM TPE" sous "OEM"),
     --no-body-emails, --include-intermediate, --attachments-text, --log-dir.
   * Sélection interactive : « 1-3 », « 1 - 3 », « 1,4-6 », « tous », « q » ;
     stdin fermé / non interactif géré proprement (message, pas de boucle infinie).
@@ -32,7 +33,7 @@ import sys
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -101,9 +102,11 @@ def build_parser() -> argparse.ArgumentParser:
     flt.add_argument("--no-body-emails", action="store_true",
                      help="Ne pas extraire les adresses citees dans le corps des messages")
 
-    att = p.add_argument_group("pieces jointes (experimental : le texte n'est pas encore exploite)")
-    att.add_argument("--attachments-text", action="store_true",
-                     help="Lire le texte des pieces jointes (PDF / OCR) ; lent")
+    att = p.add_argument_group("pieces jointes (PDF / OCR / vCards, extraction parallele)")
+    att.add_argument("--attachments-text", action="store_true", default=True,
+                     help="Lire le texte des pieces jointes (PDF / OCR / vCards) ; active par defaut")
+    att.add_argument("--no-attachments-text", action="store_false", dest="attachments_text",
+                     help="Ne pas lire le texte des pieces jointes")
     att.add_argument("--no-attachments", action="store_true", help="Ne pas analyser les pieces jointes")
     att.add_argument("--no-pdf", action="store_true", help="Ignorer les PDF")
     att.add_argument("--no-images", action="store_true", help="Ignorer les images")
@@ -225,20 +228,29 @@ def select_folders_to_process(outlook_connector):
 
 
 def _select_by_names(outlook_connector, names: List[str]):
-    """--folders : correspondance insensible à la casse ; None si un nom est inconnu."""
-    available = outlook_connector.get_direct_subfolders(outlook_connector.get_inbox())
-    by_name = {f.name.lower(): f for f in available}
+    """--folders : correspondance insensible à la casse sur TOUTE l'arborescence
+    (ex : "SCAM TPE" sous "OEM") ; None si un nom est inconnu."""
+    inbox = outlook_connector.get_inbox()
+    available = list(outlook_connector.get_all_subfolders(inbox))
+    by_name: Dict[str, List] = {}
+    for f in available:
+        by_name.setdefault(f.name.lower(), []).append(f)
     missing = [n for n in names if n.lower() not in by_name]
     if missing:
         print(f"Dossier(s) introuvable(s) : {', '.join(missing)}")
-        print("Disponibles : " + ", ".join(f.name for f in available))
+        print("Disponibles : " + ", ".join(sorted({f.name for f in available})))
         return None
     selected, seen = [], set()
     for n in names:
-        f = by_name[n.lower()]
-        if f.path not in seen:
-            seen.add(f.path)
-            selected.append(f)
+        matches = by_name[n.lower()]
+        if len(matches) > 1:
+            print(f"Dossier '{n}' present {len(matches)} fois : tous inclus.")
+            for m in matches:
+                print(f"  - {m.path}")
+        for f in matches:
+            if f.path not in seen:
+                seen.add(f.path)
+                selected.append(f)
     return selected
 
 
