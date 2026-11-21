@@ -20,10 +20,14 @@ Optimisations & Corrections :
   * FIABILITE ENTREPRISES : utils.is_plausible_company rejette les phrases,
     slogans, sigles courts hors domaine et fragments de signature ; societe =
     nom du contact refusee ; noms nettoyees (email embarque, " / ", " - ").
+  * COHERENCE EMAIL : _company_matches_email refuse une entreprise qui ne
+    recoupe pas le domaine de l'adresse (TORAY sur @prindustries.fr = faux),
+    controle desactive pour les boites webmail (gmail, outlook...).
 """
 import re
 import logging
 import traceback
+import unicodedata
 from typing import List, Optional, Any, Dict, Tuple, Set
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -330,6 +334,44 @@ def _upper_token_matches_domain(token: str, email: str) -> bool:
         return False
     domain_token = _company_domain_token(email)
     return bool(domain_token and (token in domain_token or domain_token in token))
+
+
+_WELL_KNOWN_EMAIL_PROVIDERS = {
+    "gmail", "googlemail", "hotmail", "live", "msn", "outlook", "orange",
+    "wanadoo", "free", "laposte", "sfr", "aol", "icloud", "me", "protonmail",
+    "proton", "gmx", "yahoo", "ymail", "yandex", "mail",
+}
+
+
+def _strip_accents(s: str) -> str:
+    return "".join(ch for ch in unicodedata.normalize("NFKD", s or "")
+                   if not unicodedata.combining(ch))
+
+
+def _company_matches_email(company: str, email: str) -> bool:
+    """Cohérence entreprise / adresse email : le domaine doit recouper le
+    nom complet ou un mot significatif (PR INDUSTRIES @ prindustries.fr,
+    SPIG S.p.A. @ spig-gmab.com, PTSCorp @ ptscorp.co.kr). Rejette TORAY vu
+    sur une adresse PR INDUSTRIES, BAOSEM sur cprosynergie, etc. Boites
+    webmail (gmail, outlook...) : contrôle désactivé."""
+    company = (company or "").strip()
+    email_l = (email or "").lower().strip()
+    if not company or "@" not in email_l:
+        return True
+    domain = email_l.split("@", 1)[1]
+    if not domain:
+        return True
+    if domain.split(".", 1)[0] in _WELL_KNOWN_EMAIL_PROVIDERS:
+        return True
+    domain_token = _company_domain_token(email_l)
+    compact = re.sub(r"[^a-z0-9]", "", _strip_accents(company.lower()))
+    if not domain_token or not compact:
+        return True
+    if domain_token in compact or compact in domain_token:
+        return True
+    words = [w for w in re.split(r"[^a-z0-9]+", _strip_accents(company.lower()))
+             if len(w) >= 3]
+    return any(w in domain_token or domain_token in w for w in words)
 
 
 def _looks_like_project_code(s: str) -> bool:
