@@ -16,9 +16,14 @@ Améliorations intégrées :
   * Sélection multiple : Ctrl+clic / Maj+clic (sélection étendue native)
     puis « Cocher/Décocher la sélection » applique la valeur aux dossiers
     choisis, sans toucher à leurs sous-dossiers.
+  * Choix du fichier de contacts de départ : bouton « Parcourir… » dans les
+    options — le scan repart du fichier Excel choisi et de son checkpoint
+    (reprise incrémentale de ce fichier) ; sans checkpoint, relecture de
+    tous les dossiers cochés mais les contacts déjà dans le fichier sont
+    conservés et enrichis.
 """
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, filedialog, scrolledtext
 import os
 import re
 import sys
@@ -447,6 +452,8 @@ class ContactExtractionGUI:
 
         _row(0, "Nom du fichier Excel :",
              ttk.Entry(options_frame, textvariable=self.output_var, width=35))
+        ttk.Button(options_frame, text="Parcourir…",
+                   command=self._choose_base_file).grid(row=0, column=2, padx=5)
         _row(1, "Répertoire de sortie :",
              ttk.Entry(options_frame, textvariable=self.output_dir_var, width=35))
         _row(2, "Emails reçus depuis (AAAA-MM-JJ) :",
@@ -672,6 +679,32 @@ class ContactExtractionGUI:
         if not value:
             return None
         return datetime.strptime(value, "%Y-%m-%d")
+
+    def _choose_base_file(self):
+        start_dir = self.output_dir_var.get().strip() or "output"
+        path = filedialog.askopenfilename(
+            title="Repartir du fichier de contacts…",
+            initialdir=start_dir if os.path.isdir(start_dir) else ".",
+            filetypes=[("Fichier de contacts Excel", "*.xlsx"),
+                       ("Tous les fichiers", "*.*")])
+        if not path:
+            return
+        directory = os.path.dirname(path) or "."
+        name = os.path.basename(path)
+        if name.lower().endswith(".xlsx"):
+            name = name[:-5]
+        self.output_dir_var.set(directory)
+        self.output_var.set(name)
+        safe = re.sub(r"[^\w.-]+", "_", name).strip("._")
+        state_path = os.path.join(directory, f"extraction_state_{safe}.json")
+        legacy_path = os.path.join(directory, "extraction_state.json")
+        if os.path.exists(state_path) or (safe and os.path.exists(legacy_path)):
+            self._log_info(f"Base choisie : {name}.xlsx — checkpoint associé trouvé : "
+                           "reprise incrémentale de ce fichier.")
+        else:
+            self._log_info(f"Base choisie : {name}.xlsx — aucun checkpoint associé : "
+                           "tous les dossiers cochés seront relus ; les contacts déjà "
+                           "présents dans le fichier sont conservés et enrichis.")
 
     def _build_config(self) -> Optional[ExtractionConfig]:
         try:
