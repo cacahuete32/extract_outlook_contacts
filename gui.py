@@ -325,6 +325,7 @@ class ContactExtractionGUI:
         self.folders_list: List[OutlookFolder] = []
         self.folder_search_var = tk.StringVar()
         self.folder_search_var.trace_add("write", lambda *_: self._filter_folders())
+        self._folder_children: Dict[str, List[str]] = {}
         self._folder_by_key: Dict[str, OutlookFolder] = {}
         self._tree_order: List[Tuple[str, str]] = []
         self._last_folder_key: Optional[str] = None
