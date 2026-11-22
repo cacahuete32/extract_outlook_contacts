@@ -9,11 +9,13 @@ Améliorations intégrées :
   * La liste des dossiers affiche TOUTE l'arborescence (ex : OEM > SCAM TPE)
     avec indentation ; un sous-dossier profond peut etre coche seul et ses
     contacts rataches a la bonne famille client.
-  * Sélection simplifiée : arbre compact DÉPLIABLE (nœuds « + »), filtre de
-    recherche, compteur « n/N sélectionnés ».
+  * Sélection simplifiée : arbre compact DÉPLIABLE (nœuds « + »), colonne
+    « Incl. » avec case ☑/☐, filtre de recherche, compteur « n/N sélectionnés ».
+  * Cocher/décocher un dossier (colonne « Incl. », ou double-clic) s'applique
+    TOUTES ses niveaux inférieurs : toute la branche suit le parent.
   * Sélection multiple : Ctrl+clic / Maj+clic (sélection étendue native)
-    puis « Cocher/Décocher la sélection » ; double-clic coch/décoche le
-    sous-arbre entier du dossier.
+    puis « Cocher/Décocher la sélection » applique la valeur aux dossiers
+    choisis, sans toucher à leurs sous-dossiers.
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
@@ -389,13 +391,20 @@ class ContactExtractionGUI:
         ttk.Button(folders_tab, text="🔄 Rafraîchir la liste des dossiers",
                    command=self._load_folders).pack(pady=5, anchor=tk.W)
 
-        self.folder_tree = ttk.Treeview(folders_frame, show="tree",
-                                        selectmode="extended", height=18)
+        self.folder_tree = ttk.Treeview(folders_frame, columns=("sel",),
+                                        show="tree headings", selectmode="extended",
+                                        height=18)
+        self.folder_tree.heading("#0", text="Dossier", anchor=tk.W)
+        self.folder_tree.heading("sel", text="Incl.", anchor=tk.CENTER)
+        self.folder_tree.column("#0", width=420, anchor=tk.W, stretch=True)
+        self.folder_tree.column("sel", width=60, minwidth=60, anchor=tk.CENTER,
+                                stretch=False)
         tree_scroll = ttk.Scrollbar(folders_frame, orient="vertical",
                                     command=self.folder_tree.yview)
         self.folder_tree.configure(yscrollcommand=tree_scroll.set)
         self.folder_tree.pack(side="left", fill="both", expand=True)
         tree_scroll.pack(side="right", fill="y")
+        self.folder_tree.bind("<Button-1>", self._on_tree_click)
         self.folder_tree.bind("<Double-1>", self._on_tree_double_click)
 
         def _on_wheel(event):
@@ -424,7 +433,8 @@ class ContactExtractionGUI:
         self.selected_count_label = ttk.Label(buttons_frame, text="")
         self.selected_count_label.pack(side=tk.RIGHT, padx=5)
         ttk.Label(buttons_frame,
-                  text="Ctrl+ clic / Maj+clic : sélection multiple · double-clic : sous-arbre",
+                  text="Cocher : colonne « Incl. » (toujours tout le sous-arbre) · "
+                       "Ctrl/Maj+clic : sélection multiple",
                   foreground="gray").pack(side=tk.RIGHT, padx=10)
 
         # --- Onglet options
@@ -559,7 +569,8 @@ class ContactExtractionGUI:
                     self._folder_children.setdefault(parent_key, []).append(key)
                 self._tree_order.append((key, parent_key or ""))
                 self.folder_tree.insert(parent_key or "", "end", iid=key,
-                                        text=f"☐ {folder.name}", open=False)
+                                        text=str(folder.name), open=False,
+                                        values=(self._tree_glyph(key),))
 
             self._log_info(f"Trouvé {len(all_folders)} dossiers "
                            f"(arborescence dépliable : cliquez sur les « + »).")
@@ -579,15 +590,24 @@ class ContactExtractionGUI:
             self._refresh_tree_text(key)
         self._update_selected_count()
 
-    def _tree_text(self, key: str) -> str:
-        folder = self._folder_by_key.get(key)
-        if folder is None:
-            return key
-        return ("☑ " if self.folder_vars[key].get() else "☐ ") + str(folder.name)
+    def _tree_glyph(self, key: str) -> str:
+        return "☑" if self.folder_vars[key].get() else "☐"
 
     def _refresh_tree_text(self, key: str):
         if self.folder_tree.exists(key):
-            self.folder_tree.item(key, text=self._tree_text(key))
+            self.folder_tree.set(key, "sel", self._tree_glyph(key))
+
+    def _on_tree_click(self, event):
+        item = self.folder_tree.identify_row(event.y)
+        if item not in self.folder_vars:
+            return None
+        if self.folder_tree.identify_column(event.x) != "sel":
+            return None
+        state = int(event.state)
+        if state & 0x0005:   # Ctrl ou Maj : selection multiple, pas d'action
+            return None
+        self._set_tree_state(item, not self.folder_vars[item].get())
+        return "break"
 
     def _on_tree_double_click(self, event):
         item = self.folder_tree.identify_row(event.y)
@@ -626,13 +646,15 @@ class ContactExtractionGUI:
         if not query:
             for key, parent_key in self._tree_order:
                 self.folder_tree.move(key, parent_key or "", "end")
-                self.folder_tree.item(key, text=self._tree_text(key), open=False)
+                self.folder_tree.item(key, open=False)
+                self._refresh_tree_text(key)
             return
         for key, _parent in self._tree_order:
             folder = self._folder_by_key.get(key)
             if folder is not None and query in str(folder.name).lower():
                 self.folder_tree.move(key, "", "end")
-                self.folder_tree.item(key, text=self._tree_text(key), open=True)
+                self.folder_tree.item(key, open=True)
+                self._refresh_tree_text(key)
             else:
                 self.folder_tree.detach(key)
 
