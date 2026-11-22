@@ -269,7 +269,6 @@ class MailReader:
 
         recipients = self._recipients(mail) if cfg.include_recipients else []
         vcf_contacts = []
-        resolver = self._resolver
         try:
             vcf_contacts = self.outlook.get_vcf_contacts(mail)
         except Exception as e:
