@@ -25,6 +25,9 @@ Améliorations intégrées :
     societe sans sous-dossier projet) sont desormais lus par defaut — un
     dossier vide ne masque plus son parent ; l'option correspondante est
     retiree des options.
+  * EMAILS HORS PROJETS : les mails des dossiers non-projet dont l'entreprise
+    de l'expediteur est connue sont listes dans la feuille Excel
+    "Emails hors projets" (fusion sans doublons entre les lancements).
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext
@@ -938,6 +941,10 @@ class ContactExtractionGUI:
                             continue
 
                     email_data = reader.read(mail, folder, famille, mail_id, received)
+                    try:
+                        email_data.has_project = not outlook._is_leaf_folder(folder.folder)
+                    except Exception:
+                        pass
 
                     if not self._put_email(run, email_data):
                         completed = False
@@ -1021,8 +1028,9 @@ class ContactExtractionGUI:
             if com_ready:
                 pythoncom.CoUninitialize()
 
-    def _export(self, cfg: ExtractionConfig, contacts) -> Tuple[Optional[str], bool]:
-        exporter = DataExporter(contacts)
+    def _export(self, cfg: ExtractionConfig, contacts,
+                no_project_emails=None) -> Tuple[Optional[str], bool]:
+        exporter = DataExporter(contacts, no_project_emails=no_project_emails)
         out_path = os.path.join(cfg.output_dir, f"{cfg.output}.xlsx")
 
         if os.path.exists(out_path):
@@ -1126,12 +1134,14 @@ class ContactExtractionGUI:
             self._post_progress(run)
 
             contacts = extractor.contacts
+            no_project_emails = list(getattr(extractor, "emails_without_project", []))
             output_file = None
             export_ok = True
 
-            if contacts:
+            if contacts or no_project_emails:
                 try:
-                    output_file, fallback = self._export(cfg, contacts)
+                    output_file, fallback = self._export(cfg, contacts,
+                                                         no_project_emails)
                 except Exception as e:
                     export_ok = False
                     self._log_error(f"Échec de l'export Excel : {e}\n"
@@ -1145,6 +1155,9 @@ class ContactExtractionGUI:
                     self.last_generated_file = output_file
                     self._log_info(f"\nFichier généré : {output_file}")
                     self._log_info(f"Contacts extraits : {len(contacts)}")
+                    if no_project_emails:
+                        self._log_info(f"Emails hors projets : {len(no_project_emails)} "
+                                       f"(feuille \"Emails hors projets\")")
                     self._append_review(contacts, output_file)
                     suffix = " (fichier de secours)" if fallback else ""
                     verb = "interrompue" if run.cancel_event.is_set() else "terminée"

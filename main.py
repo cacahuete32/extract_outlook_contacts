@@ -27,6 +27,8 @@ Corrections par rapport à la version précédente :
   * DOSSIERS INTERMEDIAIRES : lus par defaut (--no-include-intermediate pour ne
     lire que les feuilles) - les mails des dossiers parents ne sont plus perdus
     quand un dossier societe n'a pas de sous-dossier projet.
+  * EMAILS HORS PROJETS : feuille 'Emails hors projets' exportee en plus des
+    contacts (mails des dossiers non-projet dont l'entreprise est connue).
 """
 import argparse
 import logging
@@ -282,10 +284,10 @@ def _check_orphan_state(args, state) -> bool:
     return True
 
 
-def _export(args, contacts) -> Tuple[Optional[str], bool]:
+def _export(args, contacts, no_project_emails=None) -> Tuple[Optional[str], bool]:
     """Exporte vers Excel. Renvoie (chemin, repli_utilise)."""
     from exporter import DataExporter
-    exporter = DataExporter(contacts)
+    exporter = DataExporter(contacts, no_project_emails=no_project_emails)
     try:
         path = exporter.export_to_excel(
             args.output, output_dir=args.output_dir,
@@ -341,14 +343,16 @@ def run_extraction(args, outlook_connector, folders_to_process, state) -> Tuple[
     errors = list(extractor.errors)
 
     # --- Aucun contact : le checkpoint reste valide (rien n'est perdu) ---
-    if not extractor.contacts:
+    no_project_emails = list(getattr(extractor, "emails_without_project", []))
+    if not extractor.contacts and not no_project_emails:
         print("Aucun contact extrait." + (" (erreurs, voir le journal)" if errors else ""))
         extractor.finalize()
         return None, EXIT_INTERRUPTED if interrupted else (EXIT_PARTIAL if errors else EXIT_OK)
 
     # --- Export : le checkpoint n'est validé QUE si l'export réussit ---
     try:
-        output_file, fallback = _export(args, extractor.contacts)
+        output_file, fallback = _export(args, extractor.contacts,
+                                        no_project_emails=no_project_emails)
     except ExistingFileError as e:
         print(f"ERREUR : {e}")
         print("Checkpoint NON valide : ces emails seront retraites au prochain lancement.")

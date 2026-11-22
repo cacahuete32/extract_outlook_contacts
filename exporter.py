@@ -28,6 +28,10 @@ Corrections par rapport à la version précédente :
     comme du texte et non comme des formules.
   * COHÉRENCE : 'x.com' testé avec frontière de mot ; nom de feuille Excel : le
     caractère antislash est de nouveau remplacé (la classe de caractères l'avait perdu).
+  * EMAILS HORS PROJETS : feuille 'Emails hors projets' listant les mails des
+    dossiers non-projet (parents/intermediaires) dont l'entreprise de
+    l'expediteur est identifiee (signature ou domaine du mail) ; fusion sans
+    doublons entre les lancements (cle Email + Sujet + Date).
 """
 import os
 import re
@@ -68,6 +72,8 @@ COLUMNS = [
 ]
 MERGE_KEY = ["Email", "Famille Client", "Projet"]
 NAME_COLS = ("Nom", "Prenom", "Nom de famille")
+NO_PROJECT_COLUMNS = ["Date", "Nom", "Email", "Entreprise", "Dossier", "Sujet"]
+NO_PROJECT_SHEET = "Emails hors projets"
 ACTIVITY_COLS = ("Derniere activite", "Dernier sujet")
 
 SOURCE_LABELS = {
@@ -272,8 +278,9 @@ def _norm_date_str(value: str) -> str:
 # ----------------------------------------------------------------------
 
 class DataExporter:
-    def __init__(self, contacts: List[ContactInfo]):
+    def __init__(self, contacts: List[ContactInfo], no_project_emails=None):
         self.contacts = contacts
+        self.no_project_emails = list(no_project_emails or [])
 
     # -- construction d'une ligne ---------------------------------------
     def _build_row(self, contact: ContactInfo) -> Optional[dict]:
@@ -404,6 +411,53 @@ class DataExporter:
             r["Derniere activite"] = _norm_date_str(r.get("Derniere activite", ""))
         return rows
 
+    @staticmethod
+    def _load_existing_no_project(output_path: str) -> List[dict]:
+        """Relit la feuille 'Emails hors projets' ; [] si absente ou illisible."""
+        try:
+            old_df = pd.read_excel(output_path, sheet_name=NO_PROJECT_SHEET,
+                                   dtype=str, keep_default_na=False)
+        except Exception:
+            return []
+        old_df.columns = [str(c).strip() for c in old_df.columns]
+        rows = old_df.to_dict("records")
+        for r in rows:
+            for col in NO_PROJECT_COLUMNS:
+                r.setdefault(col, "")
+            r["Date"] = _norm_date_str(r.get("Date", ""))
+        return rows
+
+    @staticmethod
+    def _np_key(row: dict) -> tuple:
+        return (str(row.get("Email") or "").strip().lower(),
+                str(row.get("Sujet") or "").strip().lower(),
+                str(row.get("Date") or "").strip())
+
+    def _merge_no_project_rows(self, old_rows: List[dict],
+                               new_rows: List[dict]) -> List[dict]:
+        """Anciennes lignes conservees ; pour chaque mail : la ligne la plus recente
+        complete les champs vides."""
+        result: List[dict] = []
+        index: Dict[tuple, int] = {}
+        for r in old_rows:
+            k = self._np_key(r)
+            if k in index:
+                continue
+            index[k] = len(result)
+            result.append({c: str(r.get(c) or "") for c in NO_PROJECT_COLUMNS})
+        for r in new_rows:
+            k = self._np_key(r)
+            row = {c: str(r.get(c) or "") for c in NO_PROJECT_COLUMNS}
+            if k in index:
+                base = result[index[k]]
+                for c in NO_PROJECT_COLUMNS:
+                    if row[c]:
+                        base[c] = row[c]
+            else:
+                index[k] = len(result)
+                result.append(row)
+        return result
+
     # -- fusion ---------------------------------------------------------
     @staticmethod
     def _row_key(row: dict, fallback: int) -> tuple:
@@ -473,13 +527,19 @@ class DataExporter:
                 if row:
                     new_rows.append(row)
 
+            new_np_rows = [dict(r) for r in self.no_project_emails]
             if not new_rows:
-                logger.warning("[EXPORTER] Aucun contact valide a exporter")
-                return None
+                np_empty = not new_np_rows
+                if np_empty and os.path.exists(output_path):
+                    np_empty = not self._load_existing_no_project(output_path)
+                if np_empty:
+                    logger.warning("[EXPORTER] Aucun contact valide a exporter")
+                    return None
 
             os.makedirs(output_dir, exist_ok=True)
 
             final_rows = new_rows
+            final_np_rows = list(new_np_rows)
             if os.path.exists(output_path):
                 self._backup(output_path)
                 if keep_backup:                      # mode refresh : copie horodatée conservée
@@ -491,6 +551,13 @@ class DataExporter:
                         logger.info(
                             "[EXPORTER] Fusion: %d lignes existantes + %d nouvelles "
                             "-> %d totales", len(old_rows), len(new_rows), len(final_rows))
+                np_old = self._load_existing_no_project(output_path)
+                if np_old or final_np_rows:
+                    if incremental:
+                        final_np_rows = self._merge_no_project_rows(np_old, new_np_rows)
+                    if final_np_rows:
+                        logger.info("[EXPORTER] Emails hors projets : %d lignes",
+                                    len(final_np_rows))
 
             columns = list(COLUMNS)
             for r in final_rows:                      # colonnes ajoutées par l'utilisateur
@@ -513,6 +580,12 @@ class DataExporter:
                         sheet = _unique_sheet_name(str(famille), seen)
                         group.to_excel(writer, index=False, sheet_name=sheet)
                         self._format_sheet(writer.sheets[sheet], group)
+
+                if final_np_rows:
+                    df_np = pd.DataFrame(final_np_rows,
+                                         columns=NO_PROJECT_COLUMNS).fillna("")
+                    df_np.to_excel(writer, index=False, sheet_name=NO_PROJECT_SHEET)
+                    self._format_sheet(writer.sheets[NO_PROJECT_SHEET], df_np)
 
             os.replace(tmp_path, output_path)   # atomique ; PermissionError si ouvert dans Excel
             return output_path

@@ -27,6 +27,10 @@ Optimisations & Corrections :
     sous-dossier vide ne masque plus ses propres mails, et les mails presents
     dans les dossiers parents (ex : OEM, societe sans projet) ne sont plus perdus ;
     --no-include-intermediate restaure l'ancien comportement (feuilles seules).
+  * EMAILS HORS PROJETS : les mails des dossiers non-projet (parents,
+    intermediaires) dont l'entreprise de l'expediteur est connue sont
+    collectes dans ContactExtractor.emails_without_project puis exportes
+    par l'exporter (feuille 'Emails hors projets', fusion sans doublons).
 """
 import re
 import logging
@@ -570,9 +574,11 @@ class EmailData:
                  sender_job_title="", sender_company="", sender_phone="",
                  sender_is_exchange=False,
                  attachments_text="", inline_images_text="", recipients=None,
-                 vcf_contacts=None, mail_id=""):  # vCards jointes -> contacts
+                 vcf_contacts=None, mail_id="",  # vCards jointes -> contacts
+                 has_project=True):  # dossier projet (feuille) ou intermediaire
         self.mail_id = mail_id
         self.folder_path = folder_path
+        self.has_project = bool(has_project)
         self.project_name = project_name
         self.subfolder = subfolder
         self.parent_name = project_name
@@ -864,6 +870,8 @@ class ContactExtractor:
         self._pending: List[Tuple[str, str, str]] = []
         self.incomplete_folders: Set[str] = set()
         self.errors: List[str] = []
+        self.emails_without_project: List[Dict[str, str]] = []
+        self._recorded_np_mail_ids: Set[str] = set()
 
         self.processed_folder_paths: Set[str] = set()
         self.process_attachments = process_attachments
@@ -1214,6 +1222,10 @@ class ContactExtractor:
                 try:
                     email_data = self.converter.convert(
                         mail, famille_client, projet, folder.path, mail_id, received)
+                    try:
+                        email_data.has_project = self.outlook._is_leaf_folder(folder.folder)
+                    except Exception:
+                        pass
                     email_data_batch.append(email_data)
                     mail_count += 1
 
@@ -1323,8 +1335,37 @@ class ContactExtractor:
             logger.error(f"[EXTRACTOR] Erreur ajout contact: {e}")
             return False
 
+    def _record_email_without_project(self, email_data: EmailData):
+        if getattr(email_data, "has_project", True):
+            return
+        email = (email_data.sender_email or "").lower().strip()
+        if not email or not is_valid_email(email):
+            return
+        with self.lock:
+            mid = email_data.mail_id or ""
+            if mid and mid in self._recorded_np_mail_ids:
+                return
+            if mid:
+                self._recorded_np_mail_ids.add(mid)
+        company = _valid_company(email_data.sender_company or "", email) \
+            or _company_from_email_safe(email)
+        company = _valid_company(company, email)
+        if not company:
+            return
+        received = email_data.received
+        with self.lock:
+            self.emails_without_project.append({
+                "Date": received.strftime("%Y-%m-%d %H:%M:%S") if received else "",
+                "Nom": email_data.sender_name or "",
+                "Email": email,
+                "Entreprise": company,
+                "Dossier": email_data.folder_path or "",
+                "Sujet": email_data.subject or "",
+            })
+
     def _process_email_data(self, email_data: EmailData) -> bool:
         try:
+            self._record_email_without_project(email_data)
             famille_client = email_data.project_name
             projet = email_data.subfolder
             received = email_data.received
