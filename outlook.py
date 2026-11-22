@@ -20,6 +20,9 @@ Corrections par rapport à la version précédente :
   * OCR : image lue une seule fois (imdecode, compatible chemins non-ASCII),
     timeout Tesseract, repli sur « eng » si le pack « fra » est absent.
   * pypdf (successeur de PyPDF2) utilisé s'il est installé.
+  * Filtre MessageClass en LIKE ('IPM.Note%') : les mails signés (IPM.Note.SMIME),
+    formulaires personnalisés et autres sous-classes ne sont plus invisibles
+    (un dossier comme OEM/SCAM TPE pouvait paraitre vide).
   * is_valid_email / parse_date délèguent à utils (plus de doublons qui
     divergent : info@ était accepté ici et rejeté ailleurs).
   * Dossier temporaire créé à la demande et supprimé par close() ;
@@ -27,6 +30,15 @@ Corrections par rapport à la version précédente :
   * root_name : chemin de la boîte de réception détecté à la connexion, donc
     correct quelle que soit la langue d'Outlook (« Bandeja de entrada »...).
   * Connexion : exception dédiée (OutlookConnectionError) avec la cause.
+  * EFFICACITÉ : les IPM.Note sont filtés par Outlook même
+    (Restrict sur MessageClass, indépendant de la locale — contrairement au
+    filtre de dates) ; extraction des pièces jointes en deux phases —
+    SaveAsFile sur le thread COM, extraction PDF/OCR en parallèle
+    (ThreadPoolExecutor) ; le dossier dont le plus récent des mails est
+    antérieur au watermark peut être ignoré d’emblée.
+  * CONTACTS : lecture des vCards .vcf jointes (champs complets : nom, poste,
+    société, Téléphone, Web, adresse) ; téléphone du correspondant : repli
+    sur le portable si la ligne fixe est absente.
 """
 import itertools
 import logging
@@ -35,8 +47,9 @@ import re
 import shutil
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Any, Generator, Iterable, List, Optional
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
 
 import win32com.client
 
@@ -95,6 +108,132 @@ PDF_MAX_PAGES = 10
 PDF_MAX_CHARS = 2000
 OCR_TIMEOUT_S = 30
 INLINE_MAX_IMAGES = 10
+
+
+_VCF_ENCODING_RE = re.compile(r"encoding=(QUOTED-PRINTABLE|BASE64)", re.IGNORECASE)
+_VCF_CHARSET_RE = re.compile(r"charset=([\w-]+)", re.IGNORECASE)
+
+
+def _decode_vcf_value(value: str, params: str) -> str:
+    m_enc = _VCF_ENCODING_RE.search(params)
+    m_cs = _VCF_CHARSET_RE.search(params)
+    charset = (m_cs.group(1) if m_cs else "utf-8")
+    try:
+        if m_enc and m_enc.group(1).lower() == "quoted-printable":
+            raw = value.encode("latin-1", "replace")
+            out = bytearray()
+            i = 0
+            while i < len(raw):
+                if raw[i] == 0x3D and i + 2 < len(raw):
+                    out.append(int(raw[i + 1:i + 3], 16) & 0xFF)
+                    i += 3
+                else:
+                    out.append(raw[i])
+                    i += 1
+            decoded = out.decode(charset, "replace")
+            return decoded.strip()
+        if m_enc and m_enc.group(1).lower() == "base64":
+            import base64
+            return base64.b64decode(
+                value.strip().encode("ascii", "ignore")).decode(charset, "replace").strip()
+    except Exception:
+        return ""
+    return value.strip()
+
+
+def _parse_vcf_bytes(data: bytes) -> List[Dict[str, str]]:
+    """Decodage vCard minimal mais robuste : repli de lignes, QUOTED-PRINTABLE
+    et BASE64 geres ; N/FN/ORG/TITLE/TEL/EMAIL/ADR/URL exploitables."""
+    try:
+        text = data.decode("utf-8", "replace")
+    except Exception:
+        return []
+    raw_lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    lines: List[str] = []
+    for line in raw_lines:
+        if line[:1] in (" ", "\t") and lines:
+            lines[-1] += line[1:]
+        else:
+            lines.append(line)
+
+    cards: List[List[str]] = []
+    current: List[str] = []
+    for line in lines:
+        upper = line.strip().upper()
+        if upper.startswith("BEGIN:VCARD"):
+            current = []
+        elif upper.startswith("END:VCARD"):
+            if current:
+                cards.append(current)
+            current = []
+        elif current is not None:
+            current.append(line)
+
+    contacts: List[Dict[str, str]] = []
+    for card in cards:
+        c: Dict[str, str] = {"email": "", "name": "", "job_title": "", "company": "",
+                             "phone": "", "website": "", "address": "",
+                             "first_name": "", "last_name": ""}
+        emails: List[str] = []
+        tels: Dict[str, str] = {}
+        for line in card:
+            if ":" not in line:
+                continue
+            head, value = line.split(":", 1)
+            key, _, params = head.partition(";")
+            value = _decode_vcf_value(value, head)
+            if not value:
+                continue
+            key_u = key.strip().upper()
+            types = {p.strip().upper() for p in params.split(";")
+                     if p and "=" not in p}
+            if key_u == "N":
+                parts = value.split(";")
+                if len(parts) >= 1:
+                    c["last_name"] = parts[0].strip()
+                if len(parts) >= 2:
+                    c["first_name"] = parts[1].strip()
+            elif key_u == "FN":
+                c["name"] = value.strip()
+            elif key_u == "TITLE":
+                c["job_title"] = value.strip()
+            elif key_u == "ORG":
+                c["company"] = value.split(";")[0].strip()
+            elif key_u == "EMAIL":
+                emails.append(value.strip())
+            elif key_u == "URL":
+                if not c["website"]:
+                    c["website"] = value.strip()
+            elif key_u == "ADR":
+                if "WORK" in types or "HOME" in types or not c["address"]:
+                    parts = [p.strip() for p in value.split(";") if p.strip()]
+                    if parts:
+                        c["address"] = ", ".join(parts)
+            elif key_u == "TEL":
+                label = ("WORK" if "WORK" in types
+                         else "CELL" if ("CELL" in types or "MOBILE" in types)
+                         else "OTHER")
+                tels.setdefault(label, value.strip())
+        for email in emails:
+            email = email.strip().strip("<>").lower()
+            if email and _utils_is_valid_email(email):
+                c["email"] = email
+                break
+            if email and not c["email"]:
+                c["email"] = email
+        c["phone"] = (tels.get("WORK") or tels.get("CELL")
+                      or (next(iter(tels.values()), "") if tels else ""))
+        if c["email"] or c["name"]:
+            if c["name"] and not (c["first_name"] and c["last_name"]):
+                parts = c["name"].split()
+                if len(parts) >= 2:
+                    c.setdefault("first_name", parts[0])
+                    c.setdefault("last_name", " ".join(parts[1:]))
+        else:
+            continue
+        contacts.append(c)
+    return contacts
+
 
 
 class OutlookConnectionError(Exception):
@@ -200,6 +339,7 @@ class OutlookConnector:
         self._system_ids: Optional[set] = None
         self._ocr_lang = "fra+eng"
         self._warned: set = set()
+        self.extraction_workers = max(1, min(4, (os.cpu_count() or 2)))
         self._connect()
         OutlookFolder.known_inbox_path = _safe_get(self.mailbox, "FolderPath")
 
@@ -372,14 +512,32 @@ class OutlookConnector:
     # Mails
     # ------------------------------------------------------------------
 
+    def _restrict_mail_items(self, items: Any) -> Tuple[Any, bool]:
+        """Filtre les IPM.Note (ET toutes leurs sous-classes : IPM.Note.SMIME,
+        formulaires personnalises...) directement dans Outlook (rapide ; sans
+        effet de locale). Renvoie (collection, ok) : ok est False si Outlook a
+        refuse le filtre (repli : iterer tel quel)."""
+        for query in (
+                '@SQL="http://schemas.microsoft.com/mapi/proptag/0x001A001E"'
+                " LIKE 'IPM.Note%'",
+                "[MessageClass] = 'IPM.Note'",
+        ):
+            try:
+                restricted = items.Restrict(query)
+                return restricted, True
+            except Exception as e:
+                logger.debug(f"[OUTLOOK] Restrict MessageClass refuse: {e}")
+        return items, False
+
     def get_mails(self, folder: Any, date_from: Optional[datetime] = None,
                   date_to: Optional[datetime] = None,
                   limit: Optional[int] = None) -> Generator[Any, None, None]:
-        """Renvoie les mails d'un dossier, du plus récent au plus ancien.
+        """Renvoie les mails d'un dossier, du plus recent au plus ancien.
 
-        Le filtre de dates est appliqué ICI (et non via Restrict, dépendant de
-        la locale Windows). Tant que le tri Outlook a fonctionné, la lecture
-        s'arrête au premier mail antérieur à date_from."""
+        Le filtre de dates est applique ICI (et non via Restrict, dependant de
+        la locale Windows). Les IPM.Note sont filtres par Outlook (Restrict) ;
+        tant que le tri Outlook a fonctionne, la lecture s'arrete au premier
+        mail anterieur a date_from."""
         try:
             items = _safe_get(folder, "Items")
             if items is None:
@@ -389,14 +547,20 @@ class OutlookConnector:
                 items.Sort("[ReceivedTime]", True)
             except Exception:
                 sorted_ok = False
+            items, restricted = self._restrict_mail_items(items)
+            if restricted:
+                try:
+                    items.Sort("[ReceivedTime]", True)
+                except Exception:
+                    sorted_ok = False
 
             count = 0
             for item in items:
                 try:
-                    message_class = _safe_get(item, "MessageClass", "")
-                    if message_class and not str(message_class).upper().startswith("IPM.NOTE"):
-                        continue
-
+                    if not restricted:
+                        message_class = _safe_get(item, "MessageClass", "")
+                        if message_class and not str(message_class).upper().startswith("IPM.NOTE"):
+                            continue
                     if date_from or date_to:
                         received = _utils_parse_date(_safe_get(item, "ReceivedTime"))
                         if received:
@@ -415,6 +579,22 @@ class OutlookConnector:
                     break
         except Exception as e:
             logger.error(f"[OUTLOOK] Erreur get_mails: {e}")
+
+    def folder_latest_received(self, folder: Any) -> Optional[datetime]:
+        """Date du mail le plus recent du dossier (lecture rapide, sans
+        iteration) : permet de sauter un dossier entier deja couvert par le
+        checkpoint."""
+        try:
+            items = _safe_get(folder, "Items")
+            if items is None:
+                return None
+            items.Sort("[ReceivedTime]", True)
+            items, _ok = self._restrict_mail_items(items)
+            items.Sort("[ReceivedTime]", True)
+            latest = _safe_get(items.GetFirst(), "ReceivedTime")
+            return _utils_parse_date(latest)
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Pièces jointes
@@ -462,7 +642,9 @@ class OutlookConnector:
         except Exception:
             return ""
 
-        texts: List[str] = []
+        # Phase 1 (thread COM) : on ne sauvegarde sur disque que les fichiers
+        # exploitables. SaveAsFile reste sur ce filtre serial (obligatoire).
+        saved: List[Tuple[str, bool]] = []   # (chemin, est_pdf)
         for attachment in items:
             file_name = None
             temp_path = None
@@ -474,7 +656,6 @@ class OutlookConnector:
                 is_pdf = lowered.endswith('.pdf')
                 is_image = lowered.endswith(IMAGE_EXTENSIONS)
 
-                # Rien n'est enregistré sur disque si le fichier n'est pas exploitable
                 if is_pdf and not can_pdf:
                     continue
                 if is_image and not can_img:
@@ -491,15 +672,78 @@ class OutlookConnector:
 
                 temp_path = self._unique_temp_path(file_name)
                 attachment.SaveAsFile(temp_path)
-                text = (self._pdf_text(temp_path) if is_pdf
-                        else self._extract_signature_text(temp_path))
-                if text:
-                    texts.append(text)
+                saved.append((temp_path, is_pdf))
             except Exception as e:
                 logger.warning(f"[OUTLOOK] Erreur piece jointe {file_name or '<inconnu>'}: {e}")
+                _remove_file(temp_path)
+
+        # Phase 2 (hors COM) : extraction PDF / OCR en parallelle. Les objets
+        # COM ne sont pas manipules ici ; seul le calcul lourd est reparti.
+        texts = self._extract_saved_files_parallel(saved)
+
+        for path, _kind in saved:
+            _remove_file(path)
+        return "\n".join(texts)
+
+    def _extract_saved_files_parallel(self, saved: List[Tuple[str, bool]]) -> List[str]:
+        """Extraction des fichiers sauvegardes, en parallelle, ordre preserve."""
+        if not saved:
+            return []
+        jobs = list(saved)
+
+        def _one(idx_job: Tuple[int, Tuple[str, bool]]) -> Tuple[int, str]:
+            idx, (path, is_pdf) = idx_job
+            try:
+                text = self._pdf_text(path) if is_pdf \
+                    else self._extract_signature_text(path)
+                return idx, (text or "")
+            except Exception as e:
+                logger.debug(f"[OUTLOOK] Extraction parallele echouee ({path}): {e}")
+                return idx, ""
+
+        results = []
+        if len(jobs) > 1 and self.extraction_workers > 1:
+            with ThreadPoolExecutor(max_workers=self.extraction_workers) as pool:
+                results = list(pool.map(_one, list(enumerate(jobs))))
+        else:
+            results = [_one(job) for job in jobs]
+        results.sort(key=lambda t: t[0])
+        return [text for _idx, text in results]
+
+    # ------------------------------------------------------------------
+    # vCard
+    # ------------------------------------------------------------------
+
+    def get_vcf_contacts(self, mail: Any) -> List[Dict[str, str]]:
+        """Contacts embarques dans des pieces jointes vCard (.vcf).
+        Une vCard porte des champs exhaustifs (nom, poste, societe, telephones,
+        site, adresse) : c'est la source la plus complete disponible dans un
+        mail. Ne necessite ni OCR ni lecteur PDF."""
+        contacts: List[Dict[str, str]] = []
+        attachments = _safe_get(mail, "Attachments")
+        if attachments is None:
+            return contacts
+        try:
+            items = list(attachments)
+        except Exception:
+            return contacts
+        for attachment in items:
+            file_name = None
+            temp_path = None
+            try:
+                file_name = _safe_get(attachment, "FileName")
+                if not isinstance(file_name, str) \
+                        or not file_name.lower().endswith('.vcf'):
+                    continue
+                temp_path = self._unique_temp_path(file_name)
+                attachment.SaveAsFile(temp_path)
+                with open(temp_path, 'rb') as f:
+                    contacts.extend(_parse_vcf_bytes(f.read()))
+            except Exception as e:
+                logger.warning(f"[OUTLOOK] Erreur vCard {file_name or '<inconnu>'}: {e}")
             finally:
                 _remove_file(temp_path)
-        return "\n".join(texts)
+        return contacts
 
     # ------------------------------------------------------------------
     # OCR

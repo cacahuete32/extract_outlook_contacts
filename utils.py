@@ -10,6 +10,10 @@ Corrections & Optimisations :
   * extract_phone & normalize_phone : support multilingue (FR, US, ES, etc.).
   * body_text_from_html : reconstruction fidèle du texte HTML sans altérer les blocs de signature.
   * _signature_company_candidate : filtrage renforcé via une liste noire d'expressions de junk/slogans/en-têtes.
+  * is_plausible_company : une entreprise ressemble à une raison sociale, jamais
+    à une phrase du message (« This message and… », « Regards », slogans,
+    fragments de bas de page) : pronoms/verbes/politesse FR-EN-ES rejets, sigles
+    courts en MAJUSCULES exigent une corrélation avec le domaine email.
   * RECHERCHE DE POSTE (faux postes tirés de phrases du corps du message) :
       - is_plausible_job_title : un intitulé est un GROUPE NOMINAL court ; refuse les
         phrases (verbes, pronoms, politesse, article en tête, ponctuation de fin...).
@@ -429,6 +433,124 @@ _NAME_LIKE_RE = re.compile(
     r"[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÿ'’-]*){1,3}$")
 
 
+# ------------------------------------------------------------------
+# Entreprises : une raison sociale, jamais une phrase
+# ------------------------------------------------------------------
+# Mots qui n'apparaissent QUE dans une phrase du corps/une signature que l'on
+# ne doit jamais prendre pour une entreprise (FR / EN / ES / IT).
+_COMPANY_STRONG_PROSE = {
+    # pronoms / demonstratifs
+    "this", "that", "these", "those", "we", "our", "us", "you", "your", "yours",
+    "they", "their", "them", "he", "she", "it", "its", "i", "me", "my",
+    "je", "tu", "il", "elle", "ils", "elles", "on", "nous", "vous", "me", "te",
+    "yo", "usted", "ustedes", "nosotros", "el", "ella",
+    # verbes / auxiliaires
+    "are", "was", "were", "is", "am", "be", "been", "being", "have", "has", "had",
+    "will", "would", "shall", "should", "can", "could", "may", "might", "must",
+    "do", "does", "did", "done", "going", "gonna", "want", "wanted", "hope",
+    "est", "sont", "suis", "es", "sera", "serait", "peux", "peut", "peuvent",
+    "pouvez", "voudrais", "souhaite", "souhaitez", "va", "vas", "vais", "allez",
+    "son", "soy", "somos", "est\u00e1", "puede", "pueden", "hemos",
+    "considered", "considers", "confirm", "confirmed", "confirms",
+    "review", "reviewed", "correct", "corrected", "removed", "remove",
+    "supply", "supplied", "damage", "damaged", "arrange", "arranged", "delete",
+    "deleted", "apologise", "apologize", "apologies", "apology", "unfortunately",
+    "unfortunatly", "consider", "consid\u00e8re", "considere", "possibilit\u00e9",
+    "possibilite", "run", "runs", "risk", "saw", "see", "seen", "envoyer",
+    "envoyez", "connait", "conna\u00eet", "member", "connexion",
+    # politesse / mail
+    "yes", "no", "not", "nor", "please", "thanks", "thank", "merci", "bonjour",
+    "bonsoir", "bonne", "bon", "hello", "hi", "hola", "regards", "saludos",
+    "salutations", "gracias", "muchas", "favor", "adjunto", "cordialement",
+    "svp", "stp", "asap", "suivez", "enviado", "oggetto", "objet", "subject",
+    "re:", "fw:", "fwd:", "notification", "param\u00e8tres", "parametres",
+    "wetransfer", "whatsapp", "linkedin", "skype", "caution", "office",
+    "mr", "mrs", "ms", "monsieur", "madame", "mme", "mlle", "test", "cde",
+    "direction", "d\u00e9partement", "departement", "department",
+    "administration", "administraci\u00f3n", "administracion",
+    "reception", "recepci\u00f3n", "bureau", "syst\u00e8me", "board", "valve",
+    "sales", "representative", "repr\u00e9sentant", "ligne", "mes", "france",
+    "service", "communiqu\u00e9", "communique",
+    # nombres crits
+    "two", "three", "four", "five", "six", "deux", "trois", "quatre",
+    "dos", "tres",
+    # mois / jours
+    "january", "february", "march", "april", "june", "july", "august",
+    "september", "october", "november", "december",
+    "janvier", "fevrier", "f\u00e9vrier", "mars", "avril", "mai", "juin",
+    "juillet", "aout", "ao\u00fbt", "septembre", "octobre", "novembre", "decembre",
+    "d\u00e9cembre", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi",
+    "dimanche", "monday", "tuesday", "wednesday", "thursday", "friday",
+    "saturday", "sunday",
+}
+# Petits mots utilitaires : tol\u00e9rs seul, rejets par deux ou en fin de nom
+_COMPANY_WEAK_PROSE = {
+    "the", "in", "on", "for", "with", "from", "about", "into", "over", "between",
+    "of", "at", "to", "by", "as", "or", "and", "but", "if", "then", "than",
+    "when", "where", "while", "le", "la", "les", "des", "du", "de", "un", "une",
+    "au", "aux", "dans", "sur", "pour", "par", "avec", "sans", "chez", "en",
+    "del", "al", "los", "las", "con", "por", "para", "per", "della", "delle",
+    "und", "der", "die", "das", "van", "von",
+}
+# Phrases / fragments vus dans les signatures qui ne sont jamais des soci\u00e9t\u00e9s
+_COMPANY_JUNK_PHRASES = (
+    "this message", "all rights", "upcoming events", "two turbines", "we are",
+    "follow us", "connect with", "visit us", "we are hiring", "we pitch",
+    "bureau d", "dir co", "bon we", "prior written", "electronic", "entity named",
+    "may be", "hereby", "confidential", "get outlook", "sent from",
+    "j'ai", "j\u2019ai", "j\u2019", "qu'", "qu\u2019", "n'", "n\u2019",
+)
+_COMPANY_JUNK_PHRASE_RE = re.compile(
+    r"(?<!\w)(?:" + "|".join(re.escape(t) for t in _COMPANY_JUNK_PHRASES) + r")(?!\w)",
+    re.IGNORECASE)
+_COMPANY_FILE_EXT_RE = re.compile(r"\.(docx?|xlsx?|pptx?|pdf|png|jpe?g|vcf|zip)$",
+                                  re.IGNORECASE)
+_COMPANY_UPPER_COMMON = {"system", "systems", "valve"}
+
+
+def is_plausible_company(name: str) -> bool:
+    """Une entreprise est une raison sociale ('SPIG S.p.A.', 'Kelvion'),
+    jamais une phrase du message, un slogan, une formule de politesse,
+    un fragment de footer ou un sigle court hors domaine."""
+    s0 = (name or "").strip()
+    if not s0:
+        return False
+    s = s0.strip(" \t.,;:!?+-\u2013\u2014|")
+    if not s:
+        return False
+    if len(s) < 2 or len(s) > 80:
+        return False
+    if s[0] in "'\u2019\"" or s[-1] in "'\u2019\"":
+        return False
+    if "->" in s or "/" in s or "@" in s or _COMPANY_FILE_EXT_RE.search(s):
+        return False
+    if _COMPANY_JUNK_PHRASE_RE.search(s):
+        return False
+    if re.search(r"https?://|www\.", s, re.IGNORECASE):
+        return False
+    tokens = [t for t in re.split(r"[^0-9a-z\u00e0-\u00ff]+", s.lower()) if t]
+    if not tokens:
+        return False
+    if len(tokens) == 1 and tokens[0] in _COMPANY_UPPER_COMMON:
+        return False
+    if tokens[0] in _COMPANY_STRONG_PROSE or tokens[0] in _COMPANY_WEAK_PROSE:
+        return False
+    if tokens[-1] in _COMPANY_STRONG_PROSE or tokens[-1] in _COMPANY_WEAK_PROSE:
+        return False
+    if any(t in _COMPANY_STRONG_PROSE for t in tokens):
+        return False
+    if sum(1 for t in tokens if t in _COMPANY_WEAK_PROSE) >= 2:
+        return False
+    if len(tokens) == 1 and tokens[0].isalpha() and 2 <= len(tokens[0]) <= 4:
+        if any(c.isupper() for c in s):
+            return False      # PT / PE / FAT / KKS / ExW / Mit... : pas sans le domaine
+    if re.search(r"\d", s) and len(s) <= 4 and not s.isupper():
+        return False          # x1 / v2... : code, pas une societe
+    if any(t.isdigit() for t in tokens[-1:]):
+        return False          # adresse postale ("Markkaweg 1"), "Option 1"
+    return True
+
+
 def is_plausible_job_title(title: str) -> bool:
     """Un intitulé de poste est un GROUPE NOMINAL court (« Chef de projet »,
     « Head of Sales »), jamais une phrase. Rejette : verbes, pronoms, politesse,
@@ -543,6 +665,8 @@ def _signature_company_candidate(line: str) -> bool:
         return False
     lower_s = s.lower()
     if _COMPANY_BLACKLIST_RE.search(lower_s):
+        return False
+    if not is_plausible_company(s):
         return False
     tokens = s.split()
     if JOB_LINE_RE.search(s):

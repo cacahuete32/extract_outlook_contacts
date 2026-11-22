@@ -6,6 +6,16 @@ Améliorations intégrées :
   * Améliorations ergonomiques et visuelles (thème, dispositions, états de boutons).
   * Checkpoint validé APRÈS un export réussi.
   * Gestion robuste des files et de la file unique vers l'UI (`ui_queue`).
+  * La liste des dossiers affiche TOUTE l'arborescence (ex : OEM > SCAM TPE)
+    avec indentation ; un sous-dossier profond peut etre coche seul et ses
+    contacts rataches a la bonne famille client.
+  * Sélection simplifiée : arbre compact DÉPLIABLE (nœuds « + »), colonne
+    « Incl. » avec case ☑/☐, filtre de recherche, compteur « n/N sélectionnés ».
+  * Cocher/décocher un dossier (colonne « Incl. », ou double-clic) s'applique
+    TOUTES ses niveaux inférieurs : toute la branche suit le parent.
+  * Sélection multiple : Ctrl+clic / Maj+clic (sélection étendue native)
+    puis « Cocher/Décocher la sélection » applique la valeur aux dossiers
+    choisis, sans toucher à leurs sous-dossiers.
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
@@ -27,7 +37,7 @@ import pythoncom
 sys.path.insert(0, str(Path(__file__).parent))
 
 from outlook import OutlookConnector, OutlookFolder
-from extractor import ContactExtractor, EmailData, PR_SMTP_ADDRESS, _mail_body
+from extractor import ContactExtractor, EmailData, MailConverter, PR_SMTP_ADDRESS, _mail_body
 from exporter import DataExporter
 from review import AccountReview
 from state import ExtractionState
@@ -56,6 +66,13 @@ def _safe(obj, attr, default=None):
         return getattr(obj, attr)
     except Exception:
         return default
+
+
+def _safe_folder_path(folder: Any) -> str:
+    try:
+        return folder.FolderPath or ""
+    except Exception:
+        return ""
 
 
 def _is_excluded(addr: str, domains: List[str]) -> bool:
@@ -137,8 +154,9 @@ class MailReader:
         self.outlook = outlook
         self.cfg = cfg
         self._warn = warn
+        self._resolver = MailConverter(outlook=outlook, include_recipients=False)
         self._sender_cache: Dict[str, Dict[str, Any]] = {}
-        self._recipient_cache: Dict[str, Tuple[str, str]] = {}
+        self._recipient_cache: Dict[str, Dict[str, Any]] = {}
 
     def _sender(self, mail) -> Dict[str, Any]:
         raw_addr = _com_str(_safe(mail, "SenderEmailAddress"))
@@ -163,7 +181,8 @@ class MailReader:
                 info["name"] = _com_str(_safe(exch, "Name")) or info["name"]
                 info["job_title"] = _com_str(_safe(exch, "JobTitle"))
                 info["company"] = _com_str(_safe(exch, "CompanyName"))
-                info["phone"] = _com_str(_safe(exch, "BusinessTelephoneNumber"))
+                info["phone"] = (_com_str(_safe(exch, "BusinessTelephoneNumber"))
+                                 or _com_str(_safe(exch, "MobileTelephoneNumber")))
                 info["is_exchange"] = True
 
             if "@" not in info["email"]:
@@ -173,31 +192,14 @@ class MailReader:
                 except Exception:
                     pass
 
+        self._resolver._fill_missing_from_directory(info)
+
         if key:
             self._sender_cache[key] = info
         return info
 
-    def _resolve_recipient(self, recipient, addr_raw: str) -> Tuple[str, str]:
-        name = _com_str(_safe(recipient, "Name"))
-        email = ""
-        try:
-            email = _com_str(recipient.PropertyAccessor.GetProperty(PR_SMTP_ADDRESS))
-        except Exception:
-            pass
-        if not email:
-            email = addr_raw
-        try:
-            entry = _safe(recipient, "AddressEntry")
-            user = entry.GetExchangeUser() if entry is not None else None
-            if user:
-                email = _com_str(_safe(user, "PrimarySmtpAddress")) or email
-                name = _com_str(_safe(user, "Name")) or name
-        except Exception:
-            pass
-        return email.lower().strip(), name
-
-    def _recipients(self, mail) -> List[Dict[str, str]]:
-        out: List[Dict[str, str]] = []
+    def _recipients(self, mail) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
         seen: Set[str] = set()
         recipients = _safe(mail, "Recipients")
         if recipients is None:
@@ -211,15 +213,24 @@ class MailReader:
                 addr_raw = _com_str(_safe(r, "Address"))
                 key = (addr_raw or _com_str(_safe(r, "Name"))).lower()
                 if key and key in self._recipient_cache:
-                    email, name = self._recipient_cache[key]
+                    info = self._recipient_cache[key]
                 else:
-                    email, name = self._resolve_recipient(r, addr_raw)
+                    resolved = self._resolver._resolve_recipient(r, addr_raw)
+                    info = {
+                        "email": resolved["email"],
+                        "name": resolved["name"],
+                        "job_title": resolved.get("job_title", "") or "",
+                        "company": resolved.get("company", "") or "",
+                        "phone": resolved.get("phone", "") or "",
+                        "is_exchange": bool(resolved.get("is_exchange")),
+                    }
                     if key:
-                        self._recipient_cache[key] = (email, name)
+                        self._recipient_cache[key] = info
+                email = info["email"]
                 if (email and email not in seen and is_valid_email(email)
                         and not _is_excluded(email, self.cfg.exclude_domains)):
                     seen.add(email)
-                    out.append({"email": email, "name": name})
+                    out.append(info)
             except Exception:
                 continue
         return out
@@ -252,6 +263,12 @@ class MailReader:
                 self._warn(f"Erreur images inline: {e}")
 
         recipients = self._recipients(mail) if cfg.include_recipients else []
+        vcf_contacts = []
+        resolver = self._resolver
+        try:
+            vcf_contacts = self.outlook.get_vcf_contacts(mail)
+        except Exception as e:
+            self._warn(f"Erreur vCard: {e}")
 
         return EmailData(
             folder_path=folder.path,
@@ -269,6 +286,7 @@ class MailReader:
             attachments_text=attachments_text,
             inline_images_text=inline_images_text,
             recipients=recipients,
+            vcf_contacts=vcf_contacts,
             mail_id=mail_id or "",
         )
 
@@ -297,9 +315,9 @@ class ContactExtractionGUI:
         self.ocr_inline_var = tk.BooleanVar(value=False)
         self.debug_var = tk.BooleanVar(value=False)
         self.all_folders_var = tk.BooleanVar(value=False)
-        self.no_attachments_var = tk.BooleanVar(value=True)
-        self.no_pdf_var = tk.BooleanVar(value=True)
-        self.no_images_var = tk.BooleanVar(value=True)
+        self.no_attachments_var = tk.BooleanVar(value=False)
+        self.no_pdf_var = tk.BooleanVar(value=False)
+        self.no_images_var = tk.BooleanVar(value=False)
         self.no_office_var = tk.BooleanVar(value=True)
         self.full_rescan_var = tk.BooleanVar(value=False)
         self.refresh_var = tk.BooleanVar(value=False)
@@ -307,6 +325,13 @@ class ContactExtractionGUI:
 
         self.folder_vars: Dict[str, tk.BooleanVar] = {}
         self.folders_list: List[OutlookFolder] = []
+        self.folder_search_var = tk.StringVar()
+        self.folder_search_var.trace_add("write", lambda *_: self._filter_folders())
+        self._folder_children: Dict[str, List[str]] = {}
+        self._folder_by_key: Dict[str, OutlookFolder] = {}
+        self._tree_order: List[Tuple[str, str]] = []
+        self._last_folder_key: Optional[str] = None
+        self._click_mode = ""
         self.last_generated_file: Optional[str] = None
 
         self.ui_queue: Queue = Queue()
@@ -366,22 +391,34 @@ class ContactExtractionGUI:
         ttk.Button(folders_tab, text="🔄 Rafraîchir la liste des dossiers",
                    command=self._load_folders).pack(pady=5, anchor=tk.W)
 
-        canvas = tk.Canvas(folders_frame, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(folders_frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        scrollable_frame.bind(
-            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        window_id = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        self.folders_container = scrollable_frame
+        self.folder_tree = ttk.Treeview(folders_frame, columns=("sel",),
+                                        show="tree headings", selectmode="extended",
+                                        height=18)
+        self.folder_tree.heading("#0", text="Dossier", anchor=tk.W)
+        self.folder_tree.heading("sel", text="Incl.", anchor=tk.CENTER)
+        self.folder_tree.column("#0", width=420, anchor=tk.W, stretch=True)
+        self.folder_tree.column("sel", width=60, minwidth=60, anchor=tk.CENTER,
+                                stretch=False)
+        tree_scroll = ttk.Scrollbar(folders_frame, orient="vertical",
+                                    command=self.folder_tree.yview)
+        self.folder_tree.configure(yscrollcommand=tree_scroll.set)
+        self.folder_tree.pack(side="left", fill="both", expand=True)
+        tree_scroll.pack(side="right", fill="y")
+        self.folder_tree.bind("<Button-1>", self._on_tree_click)
+        self.folder_tree.bind("<Double-1>", self._on_tree_double_click)
 
         def _on_wheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_wheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+            self.folder_tree.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.folder_tree.bind("<Enter>",
+                              lambda e: self.folder_tree.bind_all("<MouseWheel>", _on_wheel))
+        self.folder_tree.bind("<Leave>",
+                              lambda e: self.folder_tree.unbind_all("<MouseWheel>"))
+
+        search_frame = ttk.Frame(folders_tab)
+        search_frame.pack(fill=tk.X, pady=(5, 0))
+        ttk.Label(search_frame, text="🔍 Filtrer :").pack(side=tk.LEFT)
+        ttk.Entry(search_frame, textvariable=self.folder_search_var
+                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
         buttons_frame = ttk.Frame(folders_tab)
         buttons_frame.pack(fill=tk.X, pady=5)
@@ -389,6 +426,16 @@ class ContactExtractionGUI:
                    command=self._select_all_folders).pack(side=tk.LEFT, padx=2)
         ttk.Button(buttons_frame, text="❌ Tout désélectionner",
                    command=self._deselect_all_folders).pack(side=tk.LEFT, padx=2)
+        ttk.Button(buttons_frame, text="✔ Cocher la sélection",
+                   command=lambda: self._toggle_selection(True)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(buttons_frame, text="✘ Décocher la sélection",
+                   command=lambda: self._toggle_selection(False)).pack(side=tk.LEFT, padx=2)
+        self.selected_count_label = ttk.Label(buttons_frame, text="")
+        self.selected_count_label.pack(side=tk.RIGHT, padx=5)
+        ttk.Label(buttons_frame,
+                  text="Cocher : colonne « Incl. » (toujours tout le sous-arbre) · "
+                       "Ctrl/Maj+clic : sélection multiple",
+                  foreground="gray").pack(side=tk.RIGHT, padx=10)
 
         # --- Onglet options
         options_frame = ttk.LabelFrame(options_tab, text=" Paramètres d'extraction ", padding=10)
@@ -486,42 +533,138 @@ class ContactExtractionGUI:
     def _load_folders(self):
         self._log_info("Chargement des dossiers Outlook...")
         try:
-            for widget in self.folders_container.winfo_children():
-                widget.destroy()
             self.folder_vars.clear()
             self.folders_list = []
+            self._folder_children.clear()
+            self._folder_by_key.clear()
+            self._tree_order.clear()
+            self._last_folder_key = None
+            self._click_mode = ""
+            self.folder_tree.delete(*self.folder_tree.get_children())
 
             inbox = self.outlook.get_inbox()
-            direct_subfolders = self.outlook.get_direct_subfolders(inbox)
+            all_folders = list(self.outlook.get_all_subfolders(inbox))[:500]
 
-            if not direct_subfolders:
-                ttk.Label(self.folders_container,
-                          text="Aucun sous-dossier trouvé dans la boîte de réception.",
-                          foreground="red").pack(pady=10)
+            if not all_folders:
+                self.folder_tree.insert("", "end", iid="__empty__",
+                                        text="Aucun sous-dossier trouvé dans la boîte de réception.")
+                self._log_error("Aucun sous-dossier trouvé dans la boîte de réception.")
                 return
 
-            for folder in direct_subfolders:
-                var = tk.BooleanVar(value=True)
-                self.folder_vars[self._folder_key(folder)] = var
+            key_by_path: Dict[str, str] = {}
+            for folder in all_folders:
+                key_by_path[folder.path] = self._folder_key(folder)
+
+            for folder in all_folders:
+                key = self._folder_key(folder)
+                self.folder_vars[key] = tk.BooleanVar(value=True)
                 self.folders_list.append(folder)
+                self._folder_by_key[key] = folder
 
-                frame = ttk.Frame(self.folders_container)
-                frame.pack(fill=tk.X, pady=2)
-                ttk.Checkbutton(frame, variable=var).pack(side=tk.LEFT, padx=5)
-                ttk.Label(frame, text=f"{folder.name} ({folder.path})"
-                          ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+                parent_path = folder.path.rsplit("\\", 1)[0]
+                parent_key = key_by_path.get(parent_path)
+                if parent_key == key:
+                    parent_key = None
+                if parent_key:
+                    self._folder_children.setdefault(parent_key, []).append(key)
+                self._tree_order.append((key, parent_key or ""))
+                self.folder_tree.insert(parent_key or "", "end", iid=key,
+                                        text=str(folder.name), open=False,
+                                        values=(self._tree_glyph(key),))
 
-            self._log_info(f"Trouvé {len(direct_subfolders)} dossiers.")
+            self._log_info(f"Trouvé {len(all_folders)} dossiers "
+                           f"(arborescence dépliable : cliquez sur les « + »).")
+            self._update_selected_count()
         except Exception as e:
             self._log_error(f"Erreur lors du chargement des dossiers : {e}")
 
     def _select_all_folders(self):
-        for var in self.folder_vars.values():
+        for key, var in self.folder_vars.items():
             var.set(True)
+            self._refresh_tree_text(key)
+        self._update_selected_count()
 
     def _deselect_all_folders(self):
-        for var in self.folder_vars.values():
+        for key, var in self.folder_vars.items():
             var.set(False)
+            self._refresh_tree_text(key)
+        self._update_selected_count()
+
+    def _tree_glyph(self, key: str) -> str:
+        return "☑" if self.folder_vars[key].get() else "☐"
+
+    def _refresh_tree_text(self, key: str):
+        if self.folder_tree.exists(key):
+            self.folder_tree.set(key, "sel", self._tree_glyph(key))
+
+    def _on_tree_click(self, event):
+        item = self.folder_tree.identify_row(event.y)
+        if item not in self.folder_vars:
+            return None
+        if self.folder_tree.identify_column(event.x) != "sel":
+            return None
+        state = int(event.state)
+        if state & 0x0005:   # Ctrl ou Maj : selection multiple, pas d'action
+            return None
+        self._set_tree_state(item, not self.folder_vars[item].get())
+        return "break"
+
+    def _on_tree_double_click(self, event):
+        item = self.folder_tree.identify_row(event.y)
+        if item in self.folder_vars:
+            self._set_tree_state(item, not self.folder_vars[item].get())
+        return "break"
+
+    def _set_tree_state(self, key: str, value: bool):
+        var = self.folder_vars.get(key)
+        if var is None:
+            return
+        var.set(value)
+        self._refresh_tree_text(key)
+        stack = list(self._folder_children.get(key, ()))
+        while stack:
+            child_key = stack.pop()
+            child_var = self.folder_vars.get(child_key)
+            if child_var is not None:
+                child_var.set(value)
+                self._refresh_tree_text(child_key)
+            stack.extend(self._folder_children.get(child_key, ()))
+        self._last_folder_key = key
+        self._update_selected_count()
+
+    def _toggle_selection(self, value: bool):
+        for item in self.folder_tree.selection():
+            if item in self.folder_vars:
+                self.folder_vars[item].set(value)
+                self._refresh_tree_text(item)
+        self._update_selected_count()
+
+    def _filter_folders(self):
+        if not hasattr(self, "folder_tree"):
+            return
+        query = self.folder_search_var.get().strip().lower()
+        if not query:
+            for key, parent_key in self._tree_order:
+                self.folder_tree.move(key, parent_key or "", "end")
+                self.folder_tree.item(key, open=False)
+                self._refresh_tree_text(key)
+            return
+        for key, _parent in self._tree_order:
+            folder = self._folder_by_key.get(key)
+            if folder is not None and query in str(folder.name).lower():
+                self.folder_tree.move(key, "", "end")
+                self.folder_tree.item(key, open=True)
+                self._refresh_tree_text(key)
+            else:
+                self.folder_tree.detach(key)
+
+    def _update_selected_count(self):
+        label = getattr(self, "selected_count_label", None)
+        if label is None or not self.folders_list:
+            return
+        n = sum(1 for f in self.folders_list
+                if self.folder_vars[self._folder_key(f)].get())
+        label.config(text=f"{n}/{len(self.folders_list)} sélectionnés")
 
     @staticmethod
     def _parse_date_field(value: str) -> Optional[datetime]:
