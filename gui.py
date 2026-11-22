@@ -21,6 +21,10 @@ Améliorations intégrées :
     (reprise incrémentale de ce fichier) ; sans checkpoint, relecture de
     tous les dossiers cochés mais les contacts déjà dans le fichier sont
     conservés et enrichis.
+  * DOSSIERS INTERMEDIAIRES : les mails des dossiers parents (ex : OEM,
+    societe sans sous-dossier projet) sont desormais lus par defaut — un
+    dossier vide ne masque plus son parent ; l'option correspondante est
+    retiree des options.
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext
@@ -119,7 +123,6 @@ class ExtractionConfig:
     sheet_per_project: bool
     ocr_inline: bool
     debug: bool
-    all_folders: bool
     no_attachments: bool
     no_pdf: bool
     no_images: bool
@@ -318,7 +321,6 @@ class ContactExtractionGUI:
         self.sheet_per_project_var = tk.BooleanVar(value=False)
         self.ocr_inline_var = tk.BooleanVar(value=False)
         self.debug_var = tk.BooleanVar(value=False)
-        self.all_folders_var = tk.BooleanVar(value=False)
         self.no_attachments_var = tk.BooleanVar(value=False)
         self.no_pdf_var = tk.BooleanVar(value=False)
         self.no_images_var = tk.BooleanVar(value=False)
@@ -468,7 +470,6 @@ class ContactExtractionGUI:
             ("Inclure les expéditeurs", self.include_senders_var),
             ("Inclure les destinataires", self.include_recipients_var),
             ("Mode debug (logs détaillés)", self.debug_var),
-            ("Inclure aussi les mails des dossiers intermédiaires", self.all_folders_var),
             ("Une feuille Excel par famille client", self.sheet_per_project_var),
             ("OCR des images inline (logos - déconseillé)", self.ocr_inline_var),
             ("Ignorer les pièces jointes", self.no_attachments_var),
@@ -747,7 +748,6 @@ class ContactExtractionGUI:
             sheet_per_project=self.sheet_per_project_var.get(),
             ocr_inline=self.ocr_inline_var.get(),
             debug=self.debug_var.get(),
-            all_folders=self.all_folders_var.get(),
             no_attachments=self.no_attachments_var.get(),
             no_pdf=self.no_pdf_var.get(),
             no_images=self.no_images_var.get(),
@@ -887,10 +887,7 @@ class ContactExtractionGUI:
     @staticmethod
     def _folders_to_scan(outlook: OutlookConnector, com_folder, parent: OutlookFolder,
                          cfg: ExtractionConfig) -> List[OutlookFolder]:
-        if cfg.all_folders:
-            return [parent] + list(outlook.get_all_subfolders(com_folder))
-        leaves = list(outlook.get_leaf_folders(com_folder))
-        return leaves or [parent]
+        return [parent] + list(outlook.get_all_subfolders(com_folder))
 
     def _put_email(self, run: RunContext, item) -> bool:
         while not (run.loader_stop.is_set() or run.cancel_event.is_set()):

@@ -23,6 +23,10 @@ Optimisations & Corrections :
   * COHERENCE EMAIL : _company_matches_email refuse une entreprise qui ne
     recoupe pas le domaine de l'adresse (TORAY sur @prindustries.fr = faux),
     controle desactive pour les boites webmail (gmail, outlook...).
+  * DOSSIERS INTERMEDIAIRES : lus par defaut - un dossier societe avec un unique
+    sous-dossier vide ne masque plus ses propres mails, et les mails presents
+    dans les dossiers parents (ex : OEM, societe sans projet) ne sont plus perdus ;
+    --no-include-intermediate restaure l'ancien comportement (feuilles seules).
 """
 import re
 import logging
@@ -834,7 +838,7 @@ class ContactExtractor:
         state=None,
         full_rescan=False,
         process_body_emails=True,
-        include_intermediate=False,
+        include_intermediate=True,
         read_attachment_text=True,
         refresh=False,
         max_workers=4,

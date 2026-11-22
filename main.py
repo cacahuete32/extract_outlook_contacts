@@ -24,6 +24,9 @@ Corrections par rapport à la version précédente :
     (pandas, win32com...) différés : --help et les erreurs d'arguments sont instantanés.
   * Code de sortie : 0 ok, 1 échec, 3 terminé avec erreurs de dossiers,
     130 interrompu (Ctrl+C).
+  * DOSSIERS INTERMEDIAIRES : lus par defaut (--no-include-intermediate pour ne
+    lire que les feuilles) - les mails des dossiers parents ne sont plus perdus
+    quand un dossier societe n'a pas de sous-dossier projet.
 """
 import argparse
 import logging
@@ -86,8 +89,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Traite tous les dossiers de la boite de reception")
     sel.add_argument("--folders", default="",
                      help="Dossiers a traiter (noms separes par des virgules, sans interaction)")
-    sel.add_argument("--include-intermediate", action="store_true",
-                     help="Lire aussi les mails des dossiers intermediaires (pas seulement les feuilles)")
+    sel.add_argument("--include-intermediate", action=argparse.BooleanOptionalAction,
+                     default=True,
+                     help="Lire aussi les mails des dossiers intermediaires (par defaut) ; --no-include-intermediate pour ne lire que les feuilles")
 
     flt = p.add_argument_group("filtres")
     flt.add_argument("--date-from", type=_date_arg, default=None,
