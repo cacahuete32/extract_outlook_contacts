@@ -9,11 +9,11 @@ Améliorations intégrées :
   * La liste des dossiers affiche TOUTE l'arborescence (ex : OEM > SCAM TPE)
     avec indentation ; un sous-dossier profond peut etre coche seul et ses
     contacts rataches a la bonne famille client.
-  * Sélection simplifiée : filtre de recherche, cocher un dossier coche
-    tous ses sous-dossiers d'un coup, compteur « n/N sélectionnés ».
-  * Sélection multiple à la souris : Ctrl+clic coche/décoche une seule
-    case, Maj+clic applique la valeur à toute la plage depuis la dernière
-    case cliquée (indépendantes des sous-dossiers masqués par le filtre).
+  * Sélection simplifiée : arbre compact DÉPLIABLE (nœuds « + »), filtre de
+    recherche, compteur « n/N sélectionnés ».
+  * Sélection multiple : Ctrl+clic / Maj+clic (sélection étendue native)
+    puis « Cocher/Décocher la sélection » ; double-clic coch/décoche le
+    sous-arbre entier du dossier.
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
@@ -325,9 +325,8 @@ class ContactExtractionGUI:
         self.folders_list: List[OutlookFolder] = []
         self.folder_search_var = tk.StringVar()
         self.folder_search_var.trace_add("write", lambda *_: self._filter_folders())
-        self._folder_frames: List[Tuple[OutlookFolder, ttk.Frame]] = []
-        self._folder_children: Dict[str, List[str]] = {}
-        self._folder_visible: Dict[str, bool] = {}
+        self._folder_by_key: Dict[str, OutlookFolder] = {}
+        self._tree_order: List[Tuple[str, str]] = []
         self._last_folder_key: Optional[str] = None
         self._click_mode = ""
         self.last_generated_file: Optional[str] = None
@@ -389,22 +388,21 @@ class ContactExtractionGUI:
         ttk.Button(folders_tab, text="🔄 Rafraîchir la liste des dossiers",
                    command=self._load_folders).pack(pady=5, anchor=tk.W)
 
-        canvas = tk.Canvas(folders_frame, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(folders_frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        scrollable_frame.bind(
-            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        window_id = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        self.folders_container = scrollable_frame
+        self.folder_tree = ttk.Treeview(folders_frame, show="tree",
+                                        selectmode="extended", height=18)
+        tree_scroll = ttk.Scrollbar(folders_frame, orient="vertical",
+                                    command=self.folder_tree.yview)
+        self.folder_tree.configure(yscrollcommand=tree_scroll.set)
+        self.folder_tree.pack(side="left", fill="both", expand=True)
+        tree_scroll.pack(side="right", fill="y")
+        self.folder_tree.bind("<Double-1>", self._on_tree_double_click)
 
         def _on_wheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_wheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+            self.folder_tree.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.folder_tree.bind("<Enter>",
+                              lambda e: self.folder_tree.bind_all("<MouseWheel>", _on_wheel))
+        self.folder_tree.bind("<Leave>",
+                              lambda e: self.folder_tree.unbind_all("<MouseWheel>"))
 
         search_frame = ttk.Frame(folders_tab)
         search_frame.pack(fill=tk.X, pady=(5, 0))
@@ -418,9 +416,14 @@ class ContactExtractionGUI:
                    command=self._select_all_folders).pack(side=tk.LEFT, padx=2)
         ttk.Button(buttons_frame, text="❌ Tout désélectionner",
                    command=self._deselect_all_folders).pack(side=tk.LEFT, padx=2)
+        ttk.Button(buttons_frame, text="✔ Cocher la sélection",
+                   command=lambda: self._toggle_selection(True)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(buttons_frame, text="✘ Décocher la sélection",
+                   command=lambda: self._toggle_selection(False)).pack(side=tk.LEFT, padx=2)
         self.selected_count_label = ttk.Label(buttons_frame, text="")
         self.selected_count_label.pack(side=tk.RIGHT, padx=5)
-        ttk.Label(buttons_frame, text="Maj+clic : plage  ·  Ctrl+clic : une case",
+        ttk.Label(buttons_frame,
+                  text="Ctrl+ clic / Maj+clic : sélection multiple · double-clic : sous-arbre",
                   foreground="gray").pack(side=tk.RIGHT, padx=10)
 
         # --- Onglet options
@@ -519,25 +522,22 @@ class ContactExtractionGUI:
     def _load_folders(self):
         self._log_info("Chargement des dossiers Outlook...")
         try:
-            for widget in self.folders_container.winfo_children():
-                widget.destroy()
             self.folder_vars.clear()
             self.folders_list = []
-            self._folder_frames.clear()
             self._folder_children.clear()
-            self._folder_visible.clear()
+            self._folder_by_key.clear()
+            self._tree_order.clear()
             self._last_folder_key = None
             self._click_mode = ""
+            self.folder_tree.delete(*self.folder_tree.get_children())
 
             inbox = self.outlook.get_inbox()
-            inbox_path = (getattr(self.outlook, "inbox_path", None)
-                          or _safe_folder_path(inbox))
             all_folders = list(self.outlook.get_all_subfolders(inbox))[:500]
 
             if not all_folders:
-                ttk.Label(self.folders_container,
-                          text="Aucun sous-dossier trouvé dans la boîte de réception.",
-                          foreground="red").pack(pady=10)
+                self.folder_tree.insert("", "end", iid="__empty__",
+                                        text="Aucun sous-dossier trouvé dans la boîte de réception.")
+                self._log_error("Aucun sous-dossier trouvé dans la boîte de réception.")
                 return
 
             key_by_path: Dict[str, str] = {}
@@ -546,95 +546,94 @@ class ContactExtractionGUI:
 
             for folder in all_folders:
                 key = self._folder_key(folder)
-                var = tk.BooleanVar(value=True)
-                self.folder_vars[key] = var
+                self.folder_vars[key] = tk.BooleanVar(value=True)
                 self.folders_list.append(folder)
-
-                depth = max(0, folder.path.count("\\")
-                            - (inbox_path.count("\\") if inbox_path else 1))
-                indent = "     " * min(depth, 6) + ("└ " if depth else "")
-                frame = ttk.Frame(self.folders_container)
-                frame.pack(fill=tk.X, pady=1)
-                cb = ttk.Checkbutton(frame, variable=var,
-                                     command=lambda k=key: self._on_folder_toggle(k))
-                cb.bind("<Shift-Button-1>",
-                        lambda e, m="shift": self._set_click_mode(m))
-                cb.bind("<Control-Button-1>",
-                        lambda e, m="ctrl": self._set_click_mode(m))
-                cb.pack(side=tk.LEFT, padx=(5 + 12 * min(depth, 6), 5))
-                ttk.Label(frame, text=f"{indent}{folder.name}"
-                          ).pack(side=tk.LEFT, fill=tk.X, expand=True)
-                self._folder_frames.append((folder, frame))
-                self._folder_visible[key] = True
+                self._folder_by_key[key] = folder
 
                 parent_path = folder.path.rsplit("\\", 1)[0]
                 parent_key = key_by_path.get(parent_path)
-                if parent_key and parent_key != key:
+                if parent_key == key:
+                    parent_key = None
+                if parent_key:
                     self._folder_children.setdefault(parent_key, []).append(key)
+                self._tree_order.append((key, parent_key or ""))
+                self.folder_tree.insert(parent_key or "", "end", iid=key,
+                                        text=f"☐ {folder.name}", open=False)
 
-            self._log_info(f"Trouvé {len(all_folders)} dossiers (arborescence complète).")
+            self._log_info(f"Trouvé {len(all_folders)} dossiers "
+                           f"(arborescence dépliable : cliquez sur les « + »).")
             self._update_selected_count()
         except Exception as e:
             self._log_error(f"Erreur lors du chargement des dossiers : {e}")
 
     def _select_all_folders(self):
-        for var in self.folder_vars.values():
+        for key, var in self.folder_vars.items():
             var.set(True)
+            self._refresh_tree_text(key)
         self._update_selected_count()
 
     def _deselect_all_folders(self):
-        for var in self.folder_vars.values():
+        for key, var in self.folder_vars.items():
             var.set(False)
+            self._refresh_tree_text(key)
         self._update_selected_count()
 
-    def _set_click_mode(self, mode: str):
-        self._click_mode = mode
+    def _tree_text(self, key: str) -> str:
+        folder = self._folder_by_key.get(key)
+        if folder is None:
+            return key
+        return ("☑ " if self.folder_vars[key].get() else "☐ ") + str(folder.name)
 
-    def _on_folder_toggle(self, key: str):
+    def _refresh_tree_text(self, key: str):
+        if self.folder_tree.exists(key):
+            self.folder_tree.item(key, text=self._tree_text(key))
+
+    def _on_tree_double_click(self, event):
+        item = self.folder_tree.identify_row(event.y)
+        if item in self.folder_vars:
+            self._set_tree_state(item, not self.folder_vars[item].get())
+        return "break"
+
+    def _set_tree_state(self, key: str, value: bool):
         var = self.folder_vars.get(key)
         if var is None:
             return
-        mode = self._click_mode
-        self._click_mode = ""
-        value = var.get()
-        if mode == "ctrl":
-            pass
-        elif mode == "shift" and self._last_folder_key in self.folder_vars:
-            self._apply_range(self._last_folder_key, key, value)
-        else:
-            stack = list(self._folder_children.get(key, ()))
-            while stack:
-                child_key = stack.pop()
-                child_var = self.folder_vars.get(child_key)
-                if child_var is not None:
-                    child_var.set(value)
-                stack.extend(self._folder_children.get(child_key, ()))
+        var.set(value)
+        self._refresh_tree_text(key)
+        stack = list(self._folder_children.get(key, ()))
+        while stack:
+            child_key = stack.pop()
+            child_var = self.folder_vars.get(child_key)
+            if child_var is not None:
+                child_var.set(value)
+                self._refresh_tree_text(child_key)
+            stack.extend(self._folder_children.get(child_key, ()))
         self._last_folder_key = key
         self._update_selected_count()
 
-    def _apply_range(self, key_from: str, key_to: str, value: bool):
-        order = [self._folder_key(f) for f, _ in self._folder_frames]
-        visible = [k for k in order if self._folder_visible.get(k, True)]
-        if key_from not in visible or key_to not in visible:
-            return
-        i1, i2 = visible.index(key_from), visible.index(key_to)
-        if i1 > i2:
-            i1, i2 = i2, i1
-        for k in visible[i1:i2 + 1]:
-            v = self.folder_vars.get(k)
-            if v is not None:
-                v.set(value)
+    def _toggle_selection(self, value: bool):
+        for item in self.folder_tree.selection():
+            if item in self.folder_vars:
+                self.folder_vars[item].set(value)
+                self._refresh_tree_text(item)
+        self._update_selected_count()
 
     def _filter_folders(self):
+        if not hasattr(self, "folder_tree"):
+            return
         query = self.folder_search_var.get().strip().lower()
-        for folder, frame in self._folder_frames:
-            key = self._folder_key(folder)
-            visible = not query or query in str(folder.name).lower()
-            self._folder_visible[key] = visible
-            if visible:
-                frame.pack(fill=tk.X, pady=1)
+        if not query:
+            for key, parent_key in self._tree_order:
+                self.folder_tree.move(key, parent_key or "", "end")
+                self.folder_tree.item(key, text=self._tree_text(key), open=False)
+            return
+        for key, _parent in self._tree_order:
+            folder = self._folder_by_key.get(key)
+            if folder is not None and query in str(folder.name).lower():
+                self.folder_tree.move(key, "", "end")
+                self.folder_tree.item(key, text=self._tree_text(key), open=True)
             else:
-                frame.pack_forget()
+                self.folder_tree.detach(key)
 
     def _update_selected_count(self):
         label = getattr(self, "selected_count_label", None)
