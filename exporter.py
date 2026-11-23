@@ -32,6 +32,8 @@ Corrections par rapport à la version précédente :
     dossiers non-projet (parents/intermediaires) dont l'entreprise de
     l'expediteur est identifiee (signature ou domaine du mail) ; fusion sans
     doublons entre les lancements (cle Email + Sujet + Date).
+  * CONTACTS SANS DOUBLON : a l'export, une seule ligne par email - les
+    doublons d'anciens scans (meme email, projets differents) sont fondus.
 """
 import os
 import re
@@ -515,6 +517,24 @@ class DataExporter:
             groups[k] = self._merge_pair(groups[k], r) if k in groups else dict(r)
         return list(groups.values())
 
+    @staticmethod
+    def _fold_by_email(rows: List[dict]) -> List[dict]:
+        """Une seule ligne par email : les doublons d'anciens scans (même email,
+        projets différents) sont fondus ; la ligne garde le dernier projet vu."""
+        result: List[dict] = []
+        pos: Dict[str, int] = {}
+        for r in rows:
+            e = str(r.get("Email") or "").strip().lower()
+            if not e:
+                result.append(r)
+                continue
+            if e in pos:
+                result[pos[e]] = DataExporter._merge_pair(result[pos[e]], r)
+            else:
+                pos[e] = len(result)
+                result.append(dict(r))
+        return result
+
     # -- export ---------------------------------------------------------
     def export_to_excel(self, output_name, output_dir="output",
                         sheet_per_project=False, incremental=True, keep_backup=False):
@@ -558,6 +578,12 @@ class DataExporter:
                     if final_np_rows:
                         logger.info("[EXPORTER] Emails hors projets : %d lignes",
                                     len(final_np_rows))
+
+            before = len(final_rows)
+            final_rows = self._fold_by_email(final_rows)
+            if len(final_rows) != before:
+                logger.info("[EXPORTER] Doublons emails fusionnes : %d -> %d lignes",
+                            before, len(final_rows))
 
             columns = list(COLUMNS)
             for r in final_rows:                      # colonnes ajoutées par l'utilisateur

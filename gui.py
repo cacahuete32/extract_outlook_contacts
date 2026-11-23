@@ -28,6 +28,10 @@ Améliorations intégrées :
   * EMAILS HORS PROJETS : les mails des dossiers non-projet dont l'entreprise
     de l'expediteur est connue sont listes dans la feuille Excel
     "Emails hors projets" (fusion sans doublons entre les lancements).
+  * ELEMENTS ENVOYES : dossier ajoute a l'arborescence (cochable) ; ses
+    contacts ont famille/projet vides et l'entreprise deduite du domaine.
+  * CONTACTS SANS DOUBLON : un seul contact par adresse email (le projet le
+    plus recent est garde sur la ligne unique).
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext
@@ -561,6 +565,23 @@ class ContactExtractionGUI:
                 self._log_error("Aucun sous-dossier trouvé dans la boîte de réception.")
                 return
 
+            sent = self.outlook.get_sent_items()
+            if sent is not None:
+                try:
+                    sent_folder = OutlookFolder(name=sent.Name, path=sent.FolderPath,
+                                                folder=sent)
+                    key = self._folder_key(sent_folder)
+                    if key not in self.folder_vars:
+                        self.folder_vars[key] = tk.BooleanVar(value=True)
+                        self.folders_list.append(sent_folder)
+                        self._folder_by_key[key] = sent_folder
+                        self.folder_tree.insert("", "end", iid=key,
+                                                text=str(sent_folder.name), open=False,
+                                                values=(self._tree_glyph(key),))
+                        self._tree_order.append((key, ""))
+                except Exception as e:
+                    self._log_warning(f"\u00c9l\u00e9ments envoy\u00e9s indisponibles : {e}")
+
             key_by_path: Dict[str, str] = {}
             for folder in all_folders:
                 key_by_path[folder.path] = self._folder_key(folder)
@@ -942,7 +963,10 @@ class ContactExtractionGUI:
 
                     email_data = reader.read(mail, folder, famille, mail_id, received)
                     try:
-                        email_data.has_project = not outlook._is_leaf_folder(folder.folder)
+                        default = outlook.is_default_mail_folder(folder.folder)
+                        email_data.has_project = (outlook._is_leaf_folder(folder.folder)
+                                                  and not default)
+                        email_data.is_default_source = default
                     except Exception:
                         pass
 

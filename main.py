@@ -29,6 +29,8 @@ Corrections par rapport à la version précédente :
     quand un dossier societe n'a pas de sous-dossier projet.
   * EMAILS HORS PROJETS : feuille 'Emails hors projets' exportee en plus des
     contacts (mails des dossiers non-projet dont l'entreprise est connue).
+  * ELEMENTS ENVOYES : option --sent pour les inclure (contacts sans projet,
+    entreprise deduite du domaine de l'adresse).
 """
 import argparse
 import logging
@@ -94,6 +96,8 @@ def build_parser() -> argparse.ArgumentParser:
     sel.add_argument("--include-intermediate", action=argparse.BooleanOptionalAction,
                      default=True,
                      help="Lire aussi les mails des dossiers intermediaires (par defaut) ; --no-include-intermediate pour ne lire que les feuilles")
+    sel.add_argument("--sent", action="store_true",
+                     help="Lire aussi les elements envoyes (contacts sans projet, entreprise deduite du domaine)")
 
     flt = p.add_argument_group("filtres")
     flt.add_argument("--date-from", type=_date_arg, default=None,
@@ -457,6 +461,18 @@ def main(argv=None) -> int:
         if not folders_to_process:
             print("Aucun dossier selectionne.")
             return EXIT_OK
+
+        if args.sent:
+            from outlook import OutlookFolder, _safe_get as _sf
+            sent_com = outlook.get_sent_items()
+            if sent_com is not None:
+                folders_to_process.append(OutlookFolder(
+                    name=_sf(sent_com, "Name", ""),
+                    path=_sf(sent_com, "FolderPath", ""),
+                    folder=sent_com))
+                print("Elements envoyes inclus.")
+            else:
+                print("Elements envoyes indisponibles sur ce compte.")
 
         # --- Checkpoint incrémental (lié au nom du fichier de sortie) ---
         state = ExtractionState(output_dir=args.output_dir, name=args.output)

@@ -31,6 +31,12 @@ Optimisations & Corrections :
     intermediaires) dont l'entreprise de l'expediteur est connue sont
     collectes dans ContactExtractor.emails_without_project puis exportes
     par l'exporter (feuille 'Emails hors projets', fusion sans doublons).
+  * CONTACTS SANS DOUBLON : un seul contact par adresse email - meme vue dans
+    plusieurs projets, la ligne unique garde le projet le plus recent ;
+    les contacts des autres projets restent enrichis (dates, sujets).
+  * DOSSIERS STANDARDS : les dossiers standards (elements envoyes, reception)
+    donnent des contacts sans famille ni projet, entreprise deduite du
+    domaine de l'adresse ; envoyes accessibles via --sent / arborescence.
 """
 import re
 import logging
@@ -575,10 +581,12 @@ class EmailData:
                  sender_is_exchange=False,
                  attachments_text="", inline_images_text="", recipients=None,
                  vcf_contacts=None, mail_id="",  # vCards jointes -> contacts
-                 has_project=True):  # dossier projet (feuille) ou intermediaire
+                 has_project=True,  # dossier projet (feuille) ou intermediaire
+                 is_default_source=False):  # dossier standard (envoyes, reception...)
         self.mail_id = mail_id
         self.folder_path = folder_path
         self.has_project = bool(has_project)
+        self.is_default_source = bool(is_default_source)
         self.project_name = project_name
         self.subfolder = subfolder
         self.parent_name = project_name
@@ -872,6 +880,7 @@ class ContactExtractor:
         self.errors: List[str] = []
         self.emails_without_project: List[Dict[str, str]] = []
         self._recorded_np_mail_ids: Set[str] = set()
+        self._email_index: Dict[str, Tuple[str, str]] = {}
 
         self.processed_folder_paths: Set[str] = set()
         self.process_attachments = process_attachments
@@ -1223,7 +1232,10 @@ class ContactExtractor:
                     email_data = self.converter.convert(
                         mail, famille_client, projet, folder.path, mail_id, received)
                     try:
-                        email_data.has_project = self.outlook._is_leaf_folder(folder.folder)
+                        default = self.outlook.is_default_mail_folder(folder.folder)
+                        email_data.has_project = (
+                            self.outlook._is_leaf_folder(folder.folder) and not default)
+                        email_data.is_default_source = default
                     except Exception:
                         pass
                     email_data_batch.append(email_data)
@@ -1287,6 +1299,10 @@ class ContactExtractor:
 
             with self.lock:
                 existing = self._index.get((email, normalized_project))
+                if existing is None:
+                    seen_key = self._email_index.get(email)
+                    if seen_key is not None:
+                        existing = self._index.get(seen_key)
 
                 if existing is not None:
                     self._merge_contact_data(
@@ -1294,6 +1310,15 @@ class ContactExtractor:
                         website, address, last_activity, last_subject, sources=sources)
                     if subfolder:
                         existing.subfolder = subfolder
+                    if normalized_project:
+                        existing.project = project
+                        existing.parent = parent
+                        old_key = self._email_index.get(email)
+                        if old_key and old_key in self._index \
+                                and self._index[old_key] is existing:
+                            del self._index[old_key]
+                        self._index[(email, normalized_project)] = existing
+                        self._email_index[email] = (email, normalized_project)
                     return True
 
                 contact = ContactInfo()
@@ -1324,6 +1349,7 @@ class ContactExtractor:
 
                 self.contacts.append(contact)
                 self._index[(email, normalized_project)] = contact
+                self._email_index[email] = (email, normalized_project)
 
                 self._register_person(contact)
                 self._append_company_history(contact, contact.company, contact.last_activity,
@@ -1368,6 +1394,10 @@ class ContactExtractor:
             self._record_email_without_project(email_data)
             famille_client = email_data.project_name
             projet = email_data.subfolder
+            if not getattr(email_data, "has_project", True):
+                projet = ""
+            if getattr(email_data, "is_default_source", False):
+                famille_client = ""
             received = email_data.received
             subject = email_data.subject
             

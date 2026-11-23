@@ -39,6 +39,9 @@ Corrections par rapport à la version précédente :
   * CONTACTS : lecture des vCards .vcf jointes (champs complets : nom, poste,
     société, Téléphone, Web, adresse) ; téléphone du correspondant : repli
     sur le portable si la ligne fixe est absente.
+  * DOSSIER ENVOYES : get_sent_items() expose les elements envoyes ;
+    is_default_mail_folder() identifie les dossiers standards du compte
+    (contacts sans projet, entreprise deduite du domaine de l'adresse).
 """
 import itertools
 import logging
@@ -93,6 +96,7 @@ SYSTEM_FOLDERS = {
 # Codes OlDefaultFolders : Deleted, Outbox, Sent, Drafts, Junk
 _SYSTEM_FOLDER_CODES = (3, 4, 5, 16, 23)
 OL_FOLDER_INBOX = 6
+OL_FOLDER_SENT = 5                   # olFolderSentMail / Elements envoyes
 OL_MAIL_ITEM = 0                      # DefaultItemType d'un dossier de courrier
 
 PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001E"
@@ -414,6 +418,23 @@ class OutlookConnector:
 
     def get_inbox(self) -> Any:
         return self.namespace.GetDefaultFolder(OL_FOLDER_INBOX)
+
+    def get_sent_items(self) -> Optional[Any]:
+        """Dossier des elements envoyes (None si indisponible)."""
+        try:
+            return self.namespace.GetDefaultFolder(OL_FOLDER_SENT)
+        except Exception as e:
+            logger.debug(f"[OUTLOOK] Elements envoyes indisponibles: {e}")
+            return None
+
+    def is_default_mail_folder(self, folder: Any) -> bool:
+        """Vrai pour les dossiers standards du compte (reception, envoyes...):
+        leurs contacts ne sont rataches a aucun projet."""
+        try:
+            entry_id = _safe_get(folder, "EntryID")
+            return bool(entry_id) and entry_id in self._get_system_entry_ids()
+        except Exception:
+            return False
 
     def get_folder_by_entry_id(self, entry_id: str) -> Optional[Any]:
         try:
