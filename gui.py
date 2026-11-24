@@ -30,8 +30,9 @@ Améliorations intégrées :
     "Emails hors projets" (fusion sans doublons entre les lancements).
   * ELEMENTS ENVOYES : dossier ajoute a l'arborescence (cochable) ; ses
     contacts ont famille/projet vides et l'entreprise deduite du domaine.
-  * CONTACTS SANS DOUBLON : un seul contact par adresse email (le projet le
-    plus recent est garde sur la ligne unique).
+  * CONTACTS PAR PROJET : une ligne par (email + projet) ; les vues sans
+    projet (Envoyes, Reception, dossiers parents) fusionnent dans la ligne
+    du contact, pas de doublon Envoyes/Reception.
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext

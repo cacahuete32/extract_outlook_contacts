@@ -32,8 +32,9 @@ Corrections par rapport à la version précédente :
     dossiers non-projet (parents/intermediaires) dont l'entreprise de
     l'expediteur est identifiee (signature ou domaine du mail) ; fusion sans
     doublons entre les lancements (cle Email + Sujet + Date).
-  * CONTACTS SANS DOUBLON : a l'export, une seule ligne par email - les
-    doublons d'anciens scans (meme email, projets differents) sont fondus.
+  * CONTACTS PAR PROJET : a l'export, une ligne par (email + projet) - les
+    doublons d'un meme projet sont fusionnes ; une ligne sans projet
+    (Envoyes/Reception) rejoint la ligne projetee du meme email.
 """
 import os
 import re
@@ -519,21 +520,43 @@ class DataExporter:
 
     @staticmethod
     def _fold_by_email(rows: List[dict]) -> List[dict]:
-        """Une seule ligne par email : les doublons d'anciens scans (même email,
-        projets différents) sont fondus ; la ligne garde le dernier projet vu."""
+        """Une ligne par (email + projet) : les doublons d'un meme projet sont
+        fusionnes ; une ligne sans projet (Envoyes/Reception) rejoint la ligne
+        projetee du meme email — les lignes d'autres projets restent intactes."""
         result: List[dict] = []
-        pos: Dict[str, int] = {}
+        key_pos: Dict[tuple, int] = {}
+        removed: set = set()
         for r in rows:
             e = str(r.get("Email") or "").strip().lower()
+            proj = str(r.get("Projet") or "").strip().lower()
             if not e:
                 result.append(r)
                 continue
-            if e in pos:
-                result[pos[e]] = DataExporter._merge_pair(result[pos[e]], r)
-            else:
-                pos[e] = len(result)
-                result.append(dict(r))
-        return result
+            key = (e, proj)
+            if proj and key in key_pos and key_pos[key] not in removed:
+                i = key_pos[key]
+                result[i] = DataExporter._merge_pair(result[i], r)
+                continue
+            if not proj:
+                target = next((j for (me, mp), j in key_pos.items()
+                               if me == e and mp and j not in removed), None)
+                if target is not None:
+                    result[target] = DataExporter._merge_pair(result[target], r)
+                    continue
+                if key in key_pos and key_pos[key] not in removed:
+                    i = key_pos[key]
+                    result[i] = DataExporter._merge_pair(result[i], r)
+                    continue
+            if proj:
+                blank = (e, "")
+                if blank in key_pos and key_pos[blank] not in removed:
+                    j = key_pos[blank]
+                    result[j] = DataExporter._merge_pair(result[j], r)
+                    removed.add(j)
+                    del key_pos[blank]
+            key_pos[key] = len(result)
+            result.append(dict(r))
+        return [r for i, r in enumerate(result) if i not in removed]
 
     # -- export ---------------------------------------------------------
     def export_to_excel(self, output_name, output_dir="output",

@@ -31,9 +31,10 @@ Optimisations & Corrections :
     intermediaires) dont l'entreprise de l'expediteur est connue sont
     collectes dans ContactExtractor.emails_without_project puis exportes
     par l'exporter (feuille 'Emails hors projets', fusion sans doublons).
-  * CONTACTS SANS DOUBLON : un seul contact par adresse email - meme vue dans
-    plusieurs projets, la ligne unique garde le projet le plus recent ;
-    les contacts des autres projets restent enrichis (dates, sujets).
+  * CONTACTS PAR PROJET : une ligne par (email + projet) - une meme adresse
+    vue dans deux projets garde une ligne par projet ; les vues sans projet
+    (Envoyes, Reception, dossiers parents) fusionnent dans la ligne du
+    contact, pas de doublon Envoyes/Reception.
   * DOSSIERS STANDARDS : les dossiers standards (elements envoyes, reception)
     donnent des contacts sans famille ni projet, entreprise deduite du
     domaine de l'adresse ; envoyes accessibles via --sent / arborescence.
@@ -881,6 +882,7 @@ class ContactExtractor:
         self.emails_without_project: List[Dict[str, str]] = []
         self._recorded_np_mail_ids: Set[str] = set()
         self._email_index: Dict[str, Tuple[str, str]] = {}
+        self._email_blank: Dict[str, ContactInfo] = {}
 
         self.processed_folder_paths: Set[str] = set()
         self.process_attachments = process_attachments
@@ -1299,10 +1301,23 @@ class ContactExtractor:
 
             with self.lock:
                 existing = self._index.get((email, normalized_project))
-                if existing is None:
+                if existing is None and not subfolder:
                     seen_key = self._email_index.get(email)
                     if seen_key is not None:
                         existing = self._index.get(seen_key)
+                if existing is None and subfolder:
+                    blank = self._email_blank.get(email)
+                    if blank is not None:
+                        old_key = self._email_index.get(email)
+                        if old_key and old_key in self._index \
+                                and self._index[old_key] is blank:
+                            del self._index[old_key]
+                        blank.project = project
+                        blank.parent = parent
+                        self._index[(email, normalized_project)] = blank
+                        self._email_index[email] = (email, normalized_project)
+                        self._email_blank.pop(email)
+                        existing = blank
 
                 if existing is not None:
                     self._merge_contact_data(
@@ -1310,15 +1325,11 @@ class ContactExtractor:
                         website, address, last_activity, last_subject, sources=sources)
                     if subfolder:
                         existing.subfolder = subfolder
-                    if normalized_project:
                         existing.project = project
                         existing.parent = parent
-                        old_key = self._email_index.get(email)
-                        if old_key and old_key in self._index \
-                                and self._index[old_key] is existing:
-                            del self._index[old_key]
                         self._index[(email, normalized_project)] = existing
                         self._email_index[email] = (email, normalized_project)
+                        self._email_blank.pop(email, None)
                     return True
 
                 contact = ContactInfo()
@@ -1350,6 +1361,8 @@ class ContactExtractor:
                 self.contacts.append(contact)
                 self._index[(email, normalized_project)] = contact
                 self._email_index[email] = (email, normalized_project)
+                if not subfolder:
+                    self._email_blank[email] = contact
 
                 self._register_person(contact)
                 self._append_company_history(contact, contact.company, contact.last_activity,
